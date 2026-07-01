@@ -455,6 +455,173 @@ func TestProcessNextPromotesDueDelayed(t *testing.T) {
 	}
 }
 
+// --- Stats + cancellation ---
+
+func TestStatsCounts(t *testing.T) {
+	q := NewQueue("jobs", WithMaxRetries(0))
+	q.Register("ok", func(Task) error { return nil })
+	q.Register("bad", func(Task) error { return errors.New("x") })
+
+	q.Enqueue("bad", nil)
+	q.ProcessNext() // fails
+
+	q.Enqueue("ok", nil)
+	q.ProcessNext() // completes
+	q.Enqueue("ok", nil)
+	q.ProcessNext() // completes
+
+	q.Enqueue("ok", nil)                   // stays pending
+	q.EnqueueDelayed("ok", nil, time.Hour) // stays scheduled
+
+	s := q.Stats()
+	if s.Total != 5 {
+		t.Fatalf("Total = %d, want 5", s.Total)
+	}
+	if s.Completed != 2 || s.Pending != 1 || s.Failed != 1 || s.Scheduled != 1 {
+		t.Fatalf("counts wrong: %+v", s)
+	}
+}
+
+func TestCancelPendingSkipsExecution(t *testing.T) {
+	q := NewQueue("jobs")
+	var ran bool
+	q.Register("job", func(Task) error { ran = true; return nil })
+
+	id, _ := q.Enqueue("job", nil)
+	if !q.Cancel(id) {
+		t.Fatal("Cancel(pending) returned false")
+	}
+	if got, _ := q.GetTask(id); got.Status != StatusCancelled {
+		t.Fatalf("status after cancel: got %q, want %q", got.Status, StatusCancelled)
+	}
+
+	processed, _ := q.ProcessNext()
+	if processed {
+		t.Fatal("ProcessNext should skip the cancelled task and report nothing processed")
+	}
+	if ran {
+		t.Fatal("cancelled task's handler ran")
+	}
+}
+
+func TestCancelScheduled(t *testing.T) {
+	q := NewQueue("jobs")
+	id, _ := q.EnqueueDelayed("job", nil, time.Hour)
+
+	if !q.Cancel(id) {
+		t.Fatal("Cancel(scheduled) returned false")
+	}
+	if got, _ := q.GetTask(id); got.Status != StatusCancelled {
+		t.Fatalf("status after cancel: got %q, want %q", got.Status, StatusCancelled)
+	}
+}
+
+func TestCancelCompletedReturnsFalse(t *testing.T) {
+	q := NewQueue("jobs")
+	q.Register("job", func(Task) error { return nil })
+	id, _ := q.Enqueue("job", nil)
+	q.ProcessNext()
+
+	if q.Cancel(id) {
+		t.Fatal("Cancel on a completed task should return false")
+	}
+	if got, _ := q.GetTask(id); got.Status != StatusCompleted {
+		t.Fatalf("status changed after late cancel: got %q", got.Status)
+	}
+}
+
+func TestCancelUnknownReturnsFalse(t *testing.T) {
+	q := NewQueue("jobs")
+	if q.Cancel("nope") {
+		t.Fatal("Cancel on unknown id should return false")
+	}
+}
+
+func TestWorkerSkipsCancelled(t *testing.T) {
+	q := NewQueue("jobs")
+	var ranCancelled int64
+	done := make(chan struct{})
+	q.Register("cancel", func(Task) error { atomic.AddInt64(&ranCancelled, 1); return nil })
+	q.Register("keep", func(Task) error { close(done); return nil })
+
+	cancelID, _ := q.Enqueue("cancel", nil)
+	q.Enqueue("keep", nil)
+	q.Cancel(cancelID)
+
+	q.Start(1)
+	defer q.Stop()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second task never ran")
+	}
+	if got := atomic.LoadInt64(&ranCancelled); got != 0 {
+		t.Fatalf("cancelled handler ran %d times, want 0", got)
+	}
+}
+
+// --- Registry cleanup / TTL ---
+
+func TestCleanupEvictsExpiredTerminal(t *testing.T) {
+	q := NewQueue("jobs", WithTaskTTL(time.Millisecond))
+	q.Register("ok", func(Task) error { return nil })
+
+	id, _ := q.Enqueue("ok", nil)
+	q.ProcessNext()
+	if got, _ := q.GetTask(id); got.Status != StatusCompleted {
+		t.Fatalf("task not completed: %q", got.Status)
+	}
+
+	time.Sleep(5 * time.Millisecond)
+
+	if n := q.Cleanup(); n != 1 {
+		t.Fatalf("Cleanup purged %d, want 1", n)
+	}
+	if _, ok := q.GetTask(id); ok {
+		t.Fatal("task still in registry after cleanup")
+	}
+}
+
+func TestCleanupKeepsLiveAndFresh(t *testing.T) {
+	q := NewQueue("jobs", WithTaskTTL(time.Hour))
+	q.Register("ok", func(Task) error { return nil })
+
+	done, _ := q.Enqueue("ok", nil)
+	q.ProcessNext() // completed but fresh (TTL 1h)
+	pending, _ := q.Enqueue("ok", nil)
+	sched, _ := q.EnqueueDelayed("ok", nil, time.Hour)
+
+	if n := q.Cleanup(); n != 0 {
+		t.Fatalf("Cleanup purged %d, want 0", n)
+	}
+	for _, id := range []string{done, pending, sched} {
+		if _, ok := q.GetTask(id); !ok {
+			t.Fatalf("task %s was wrongly purged", id)
+		}
+	}
+}
+
+func TestCleanupLoopEvicts(t *testing.T) {
+	q := NewQueue("jobs", WithTaskTTL(time.Millisecond), WithCleanupInterval(5*time.Millisecond))
+	q.Register("ok", func(Task) error { return nil })
+
+	q.Start(1)
+	defer q.Stop()
+
+	id, _ := q.Enqueue("ok", nil)
+	waitForStatus(t, q, id, StatusCompleted, 2*time.Second)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := q.GetTask(id); !ok {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal("background cleanup never evicted the completed task")
+}
+
 // itoa is a tiny helper so tests don't depend on strconv for labels.
 func itoa(n int) string {
 	if n == 0 {

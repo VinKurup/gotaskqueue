@@ -10,9 +10,11 @@ import (
 const baseCapacity = 8
 
 const (
-	defaultMaxRetries  = 3
-	defaultBackoffBase = 100 * time.Millisecond
-	defaultBackoffMax  = 30 * time.Second
+	defaultMaxRetries      = 3
+	defaultBackoffBase     = 100 * time.Millisecond
+	defaultBackoffMax      = 30 * time.Second
+	defaultTaskTTL         = time.Hour
+	defaultCleanupInterval = time.Minute
 )
 
 var ErrQueueStopped = errors.New("queue stopped")
@@ -20,11 +22,12 @@ var ErrQueueStopped = errors.New("queue stopped")
 type TaskStatus string
 
 const (
-	StatusPending    TaskStatus = "pending"   
-	StatusScheduled  TaskStatus = "scheduled" 
+	StatusPending    TaskStatus = "pending"
+	StatusScheduled  TaskStatus = "scheduled"
 	StatusProcessing TaskStatus = "processing"
 	StatusCompleted  TaskStatus = "completed"
 	StatusFailed     TaskStatus = "failed"
+	StatusCancelled  TaskStatus = "cancelled"
 )
 
 type Task struct {
@@ -33,6 +36,7 @@ type Task struct {
 	Data       []byte
 	Status     TaskStatus
 	CreatedAt  time.Time
+	FinishedAt time.Time
 	Retries    int
 	MaxRetries int
 }
@@ -52,36 +56,50 @@ func WithBackoff(base, max time.Duration) Option {
 	}
 }
 
+func WithTaskTTL(d time.Duration) Option {
+	return func(q *Queue) { q.taskTTL = d }
+}
+
+func WithCleanupInterval(d time.Duration) Option {
+	return func(q *Queue) { q.cleanupInterval = d }
+}
+
 type Queue struct {
-	name string
-	mu   sync.Mutex
-	cond *sync.Cond
-	items []*Task
-	head  int
-	tail  int
-	count int
-	delayed delayHeap     
-	wake    chan struct{}
-	tasks    map[string]*Task   
-	handlers map[string]Handler 
-	idSeq    int64              
-	maxRetries  int
-	backoffBase time.Duration
-	backoffMax  time.Duration
-	started bool
-	stopped bool
-	wg      sync.WaitGroup 
+	name            string
+	mu              sync.Mutex
+	cond            *sync.Cond
+	items           []*Task
+	head            int
+	tail            int
+	count           int
+	delayed         delayHeap
+	wake            chan struct{}
+	tasks           map[string]*Task
+	handlers        map[string]Handler
+	idSeq           int64
+	maxRetries      int
+	backoffBase     time.Duration
+	backoffMax      time.Duration
+	taskTTL         time.Duration
+	cleanupInterval time.Duration
+	done            chan struct{}
+	started         bool
+	stopped         bool
+	wg              sync.WaitGroup
 }
 
 func NewQueue(name string, opts ...Option) *Queue {
 	q := &Queue{
-		name:        name,
-		wake:        make(chan struct{}, 1),
-		tasks:       make(map[string]*Task),
-		handlers:    make(map[string]Handler),
-		maxRetries:  defaultMaxRetries,
-		backoffBase: defaultBackoffBase,
-		backoffMax:  defaultBackoffMax,
+		name:            name,
+		wake:            make(chan struct{}, 1),
+		tasks:           make(map[string]*Task),
+		handlers:        make(map[string]Handler),
+		maxRetries:      defaultMaxRetries,
+		backoffBase:     defaultBackoffBase,
+		backoffMax:      defaultBackoffMax,
+		taskTTL:         defaultTaskTTL,
+		cleanupInterval: defaultCleanupInterval,
+		done:            make(chan struct{}),
 	}
 	q.cond = sync.NewCond(&q.mu)
 	for _, opt := range opts {
@@ -103,7 +121,7 @@ func (q *Queue) Enqueue(taskType string, data []byte) (string, error) {
 
 	t := q.buildTask(taskType, data, StatusPending)
 	q.push(t)
-	q.cond.Signal() 
+	q.cond.Signal()
 	return t.ID, nil
 }
 
@@ -161,6 +179,8 @@ func (q *Queue) Start(workers int) {
 	}
 	q.wg.Add(1)
 	go q.scheduler()
+	q.wg.Add(1)
+	go q.cleanupLoop()
 }
 
 func (q *Queue) Stop() {
@@ -170,11 +190,26 @@ func (q *Queue) Stop() {
 		return
 	}
 	q.stopped = true
-	q.cond.Broadcast() 
+	q.cond.Broadcast()
+	close(q.done)
 	q.mu.Unlock()
 
-	q.wakeScheduler() 
+	q.wakeScheduler()
 	q.wg.Wait()
+}
+
+func (q *Queue) cleanupLoop() {
+	defer q.wg.Done()
+	ticker := time.NewTicker(q.cleanupInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			q.Cleanup()
+		case <-q.done:
+			return
+		}
+	}
 }
 
 func (q *Queue) worker() {
@@ -191,10 +226,19 @@ func (q *Queue) worker() {
 func (q *Queue) waitAndPop() *Task {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	for q.count == 0 && !q.stopped {
-		q.cond.Wait()
+	for {
+		for q.count == 0 && !q.stopped {
+			q.cond.Wait()
+		}
+		t := q.dequeue()
+		if t == nil {
+			return nil
+		}
+		if t.Status == StatusCancelled {
+			continue
+		}
+		return t
 	}
-	return q.dequeue()
 }
 
 func (q *Queue) scheduler() {
@@ -231,6 +275,9 @@ func (q *Queue) promoteDue() int {
 	n := 0
 	for st := q.delayed.peek(); st != nil && !st.runAt.After(now); st = q.delayed.peek() {
 		q.delayed.pop()
+		if st.task.Status == StatusCancelled {
+			continue
+		}
 		st.task.Status = StatusPending
 		q.push(st.task)
 		n++
@@ -248,7 +295,13 @@ func (q *Queue) wakeScheduler() {
 func (q *Queue) ProcessNext() (processed bool, err error) {
 	q.mu.Lock()
 	q.promoteDue()
-	t := q.dequeue()
+	var t *Task
+	for {
+		t = q.dequeue()
+		if t == nil || t.Status != StatusCancelled {
+			break
+		}
+	}
 	q.mu.Unlock()
 	if t == nil {
 		return false, nil
@@ -285,6 +338,7 @@ func (q *Queue) retryOrFail(t *Task) {
 		return
 	}
 	t.Status = StatusFailed
+	t.FinishedAt = time.Now()
 }
 
 func (q *Queue) backoff(retries int) time.Duration {
@@ -308,7 +362,80 @@ func (q *Queue) GetTask(id string) (Task, bool) {
 func (q *Queue) setStatus(t *Task, s TaskStatus) {
 	q.mu.Lock()
 	t.Status = s
+	if s == StatusCompleted || s == StatusFailed {
+		t.FinishedAt = time.Now()
+	}
 	q.mu.Unlock()
+}
+
+func (q *Queue) Cancel(id string) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	t, ok := q.tasks[id]
+	if !ok {
+		return false
+	}
+	if t.Status == StatusPending || t.Status == StatusScheduled {
+		t.Status = StatusCancelled
+		t.FinishedAt = time.Now()
+		return true
+	}
+	return false
+}
+
+func (q *Queue) Cleanup() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.purgeExpired(time.Now())
+}
+
+func (q *Queue) purgeExpired(now time.Time) int {
+	n := 0
+	for id, t := range q.tasks {
+		if isTerminal(t.Status) && now.Sub(t.FinishedAt) > q.taskTTL {
+			delete(q.tasks, id)
+			n++
+		}
+	}
+	return n
+}
+
+func isTerminal(s TaskStatus) bool {
+	return s == StatusCompleted || s == StatusFailed || s == StatusCancelled
+}
+
+type Stats struct {
+	Pending    int
+	Scheduled  int
+	Processing int
+	Completed  int
+	Failed     int
+	Cancelled  int
+	Total      int
+}
+
+func (q *Queue) Stats() Stats {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	var s Stats
+	for _, t := range q.tasks {
+		s.Total++
+		switch t.Status {
+		case StatusPending:
+			s.Pending++
+		case StatusScheduled:
+			s.Scheduled++
+		case StatusProcessing:
+			s.Processing++
+		case StatusCompleted:
+			s.Completed++
+		case StatusFailed:
+			s.Failed++
+		case StatusCancelled:
+			s.Cancelled++
+		}
+	}
+	return s
 }
 
 func (q *Queue) push(t *Task) {
