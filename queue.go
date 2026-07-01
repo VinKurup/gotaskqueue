@@ -1,6 +1,7 @@
 package gotaskqueue
 
 import (
+	"context"
 	"errors"
 	"strconv"
 	"sync"
@@ -41,7 +42,7 @@ type Task struct {
 	MaxRetries int
 }
 
-type Handler func(Task) error
+type Handler func(context.Context, Task) error
 
 type Option func(*Queue)
 
@@ -76,6 +77,7 @@ type Queue struct {
 	wake            chan struct{}
 	tasks           map[string]*Task
 	handlers        map[string]Handler
+	inflight        map[string]context.CancelFunc
 	idSeq           int64
 	maxRetries      int
 	backoffBase     time.Duration
@@ -94,6 +96,7 @@ func NewQueue(name string, opts ...Option) *Queue {
 		wake:            make(chan struct{}, 1),
 		tasks:           make(map[string]*Task),
 		handlers:        make(map[string]Handler),
+		inflight:        make(map[string]context.CancelFunc),
 		maxRetries:      defaultMaxRetries,
 		backoffBase:     defaultBackoffBase,
 		backoffMax:      defaultBackoffMax,
@@ -313,13 +316,30 @@ func (q *Queue) runTask(t *Task) error {
 	q.mu.Lock()
 	t.Status = StatusProcessing
 	h, ok := q.handlers[t.Type]
-	q.mu.Unlock()
-
 	if !ok {
+		q.mu.Unlock()
 		q.setStatus(t, StatusFailed)
 		return errors.New("no handler registered for task type " + t.Type)
 	}
-	if err := h(*t); err != nil {
+	ctx, cancel := context.WithCancel(context.Background())
+	q.inflight[t.ID] = cancel
+	q.mu.Unlock()
+
+	err := h(ctx, *t)
+
+	q.mu.Lock()
+	delete(q.inflight, t.ID)
+	cancelled := ctx.Err() != nil
+	cancel()
+	if cancelled {
+		t.Status = StatusCancelled
+		t.FinishedAt = time.Now()
+		q.mu.Unlock()
+		return err
+	}
+	q.mu.Unlock()
+
+	if err != nil {
 		q.retryOrFail(t)
 		return err
 	}
@@ -375,10 +395,16 @@ func (q *Queue) Cancel(id string) bool {
 	if !ok {
 		return false
 	}
-	if t.Status == StatusPending || t.Status == StatusScheduled {
+	switch t.Status {
+	case StatusPending, StatusScheduled:
 		t.Status = StatusCancelled
 		t.FinishedAt = time.Now()
 		return true
+	case StatusProcessing:
+		if cancel, ok := q.inflight[t.ID]; ok {
+			cancel()
+			return true
+		}
 	}
 	return false
 }
