@@ -9,53 +9,84 @@ import (
 
 const baseCapacity = 8
 
+const (
+	defaultMaxRetries  = 3
+	defaultBackoffBase = 100 * time.Millisecond
+	defaultBackoffMax  = 30 * time.Second
+)
+
 var ErrQueueStopped = errors.New("queue stopped")
 
 type TaskStatus string
 
 const (
-	StatusPending    TaskStatus = "pending"
+	StatusPending    TaskStatus = "pending"   
+	StatusScheduled  TaskStatus = "scheduled" 
 	StatusProcessing TaskStatus = "processing"
 	StatusCompleted  TaskStatus = "completed"
 	StatusFailed     TaskStatus = "failed"
 )
 
 type Task struct {
-	ID        string
-	Type      string
-	Data      []byte
-	Status    TaskStatus
-	CreatedAt time.Time
+	ID         string
+	Type       string
+	Data       []byte
+	Status     TaskStatus
+	CreatedAt  time.Time
+	Retries    int
+	MaxRetries int
 }
 
 type Handler func(Task) error
 
+type Option func(*Queue)
+
+func WithMaxRetries(n int) Option {
+	return func(q *Queue) { q.maxRetries = n }
+}
+
+func WithBackoff(base, max time.Duration) Option {
+	return func(q *Queue) {
+		q.backoffBase = base
+		q.backoffMax = max
+	}
+}
+
 type Queue struct {
 	name string
 	mu   sync.Mutex
-	cond *sync.Cond 
-
+	cond *sync.Cond
 	items []*Task
 	head  int
 	tail  int
 	count int
-
+	delayed delayHeap     
+	wake    chan struct{}
 	tasks    map[string]*Task   
 	handlers map[string]Handler 
 	idSeq    int64              
-
+	maxRetries  int
+	backoffBase time.Duration
+	backoffMax  time.Duration
 	started bool
 	stopped bool
 	wg      sync.WaitGroup 
 }
 
-func NewQueue(name string) *Queue {
+func NewQueue(name string, opts ...Option) *Queue {
 	q := &Queue{
-		name:     name,
-		tasks:    make(map[string]*Task),
-		handlers: make(map[string]Handler),
+		name:        name,
+		wake:        make(chan struct{}, 1),
+		tasks:       make(map[string]*Task),
+		handlers:    make(map[string]Handler),
+		maxRetries:  defaultMaxRetries,
+		backoffBase: defaultBackoffBase,
+		backoffMax:  defaultBackoffMax,
 	}
 	q.cond = sync.NewCond(&q.mu)
+	for _, opt := range opts {
+		opt(q)
+	}
 	return q
 }
 
@@ -66,25 +97,46 @@ func (q *Queue) Enqueue(taskType string, data []byte) (string, error) {
 
 	q.mu.Lock()
 	defer q.mu.Unlock()
-
 	if q.stopped {
 		return "", ErrQueueStopped
 	}
 
-	q.idSeq++
-	t := &Task{
-		ID:        strconv.FormatInt(q.idSeq, 10),
-		Type:      taskType,
-		Data:      data,
-		Status:    StatusPending,
-		CreatedAt: time.Now(),
-	}
-	q.tasks[t.ID] = t
+	t := q.buildTask(taskType, data, StatusPending)
 	q.push(t)
 	q.cond.Signal() 
 	return t.ID, nil
 }
 
+func (q *Queue) EnqueueDelayed(taskType string, data []byte, delay time.Duration) (string, error) {
+	if taskType == "" {
+		return "", errors.New("task type cannot be empty")
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.stopped {
+		return "", ErrQueueStopped
+	}
+
+	t := q.buildTask(taskType, data, StatusScheduled)
+	q.delayed.push(&scheduledTask{task: t, runAt: time.Now().Add(delay)})
+	q.wakeScheduler()
+	return t.ID, nil
+}
+
+func (q *Queue) buildTask(taskType string, data []byte, status TaskStatus) *Task {
+	q.idSeq++
+	t := &Task{
+		ID:         strconv.FormatInt(q.idSeq, 10),
+		Type:       taskType,
+		Data:       data,
+		Status:     status,
+		CreatedAt:  time.Now(),
+		MaxRetries: q.maxRetries,
+	}
+	q.tasks[t.ID] = t
+	return t
+}
 
 func (q *Queue) Register(taskType string, h Handler) {
 	q.mu.Lock()
@@ -107,6 +159,8 @@ func (q *Queue) Start(workers int) {
 		q.wg.Add(1)
 		go q.worker()
 	}
+	q.wg.Add(1)
+	go q.scheduler()
 }
 
 func (q *Queue) Stop() {
@@ -116,12 +170,12 @@ func (q *Queue) Stop() {
 		return
 	}
 	q.stopped = true
-	q.cond.Broadcast()
+	q.cond.Broadcast() 
 	q.mu.Unlock()
 
+	q.wakeScheduler() 
 	q.wg.Wait()
 }
-
 
 func (q *Queue) worker() {
 	defer q.wg.Done()
@@ -140,11 +194,60 @@ func (q *Queue) waitAndPop() *Task {
 	for q.count == 0 && !q.stopped {
 		q.cond.Wait()
 	}
-	return q.dequeue() 
+	return q.dequeue()
+}
+
+func (q *Queue) scheduler() {
+	defer q.wg.Done()
+	for {
+		q.mu.Lock()
+		if q.stopped {
+			q.mu.Unlock()
+			return
+		}
+		if q.promoteDue() > 0 {
+			q.cond.Broadcast()
+			q.mu.Unlock()
+			continue
+		}
+		next := q.delayed.peek()
+		q.mu.Unlock()
+
+		if next == nil {
+			<-q.wake
+			continue
+		}
+		timer := time.NewTimer(time.Until(next.runAt))
+		select {
+		case <-timer.C:
+		case <-q.wake:
+			timer.Stop()
+		}
+	}
+}
+
+func (q *Queue) promoteDue() int {
+	now := time.Now()
+	n := 0
+	for st := q.delayed.peek(); st != nil && !st.runAt.After(now); st = q.delayed.peek() {
+		q.delayed.pop()
+		st.task.Status = StatusPending
+		q.push(st.task)
+		n++
+	}
+	return n
+}
+
+func (q *Queue) wakeScheduler() {
+	select {
+	case q.wake <- struct{}{}:
+	default:
+	}
 }
 
 func (q *Queue) ProcessNext() (processed bool, err error) {
 	q.mu.Lock()
+	q.promoteDue()
 	t := q.dequeue()
 	q.mu.Unlock()
 	if t == nil {
@@ -164,11 +267,32 @@ func (q *Queue) runTask(t *Task) error {
 		return errors.New("no handler registered for task type " + t.Type)
 	}
 	if err := h(*t); err != nil {
-		q.setStatus(t, StatusFailed)
+		q.retryOrFail(t)
 		return err
 	}
 	q.setStatus(t, StatusCompleted)
 	return nil
+}
+
+func (q *Queue) retryOrFail(t *Task) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if t.Retries < t.MaxRetries {
+		t.Retries++
+		t.Status = StatusScheduled
+		q.delayed.push(&scheduledTask{task: t, runAt: time.Now().Add(q.backoff(t.Retries))})
+		q.wakeScheduler()
+		return
+	}
+	t.Status = StatusFailed
+}
+
+func (q *Queue) backoff(retries int) time.Duration {
+	d := q.backoffBase << (retries - 1)
+	if d <= 0 || d > q.backoffMax {
+		d = q.backoffMax
+	}
+	return d
 }
 
 func (q *Queue) GetTask(id string) (Task, bool) {
@@ -219,4 +343,70 @@ func (q *Queue) grow() {
 	q.items = next
 	q.head = 0
 	q.tail = q.count
+}
+
+type scheduledTask struct {
+	task  *Task
+	runAt time.Time
+}
+
+type delayHeap struct {
+	items []*scheduledTask
+}
+
+func (h *delayHeap) peek() *scheduledTask {
+	if len(h.items) == 0 {
+		return nil
+	}
+	return h.items[0]
+}
+
+func (h *delayHeap) push(st *scheduledTask) {
+	h.items = append(h.items, st)
+	h.siftUp(len(h.items) - 1)
+}
+
+func (h *delayHeap) pop() *scheduledTask {
+	n := len(h.items)
+	if n == 0 {
+		return nil
+	}
+	root := h.items[0]
+	last := h.items[n-1]
+	h.items[n-1] = nil
+	h.items = h.items[:n-1]
+	if len(h.items) > 0 {
+		h.items[0] = last
+		h.siftDown(0)
+	}
+	return root
+}
+
+func (h *delayHeap) siftUp(i int) {
+	for i > 0 {
+		parent := (i - 1) / 2
+		if !h.items[i].runAt.Before(h.items[parent].runAt) {
+			break
+		}
+		h.items[i], h.items[parent] = h.items[parent], h.items[i]
+		i = parent
+	}
+}
+
+func (h *delayHeap) siftDown(i int) {
+	n := len(h.items)
+	for {
+		smallest := i
+		if l := 2*i + 1; l < n && h.items[l].runAt.Before(h.items[smallest].runAt) {
+			smallest = l
+		}
+		if r := 2*i + 2; r < n && h.items[r].runAt.Before(h.items[smallest].runAt) {
+			smallest = r
+		}
+		if smallest == i {
+			break
+		}
+		h.items[i], h.items[smallest] = h.items[smallest], h.items[i]
+		i = smallest
+	}
 }

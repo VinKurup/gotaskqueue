@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // --- Ring buffer mechanics (via the unexported dequeue) ---
@@ -183,7 +184,7 @@ func TestProcessNextRunsHandler(t *testing.T) {
 }
 
 func TestProcessNextHandlerError(t *testing.T) {
-	q := NewQueue("jobs")
+	q := NewQueue("jobs", WithMaxRetries(0)) // no retries: one failure is terminal
 	boom := errors.New("boom")
 	q.Register("fail", func(Task) error { return boom })
 
@@ -329,6 +330,129 @@ func TestStopIsIdempotent(t *testing.T) {
 	q.Start(2)
 	q.Stop()
 	q.Stop() // must not panic or hang
+}
+
+// --- Retries + backoff, delayed enqueue ---
+
+func waitForStatus(t *testing.T, q *Queue, id string, want TaskStatus, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if got, ok := q.GetTask(id); ok && got.Status == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	got, _ := q.GetTask(id)
+	t.Fatalf("task %s: status %q did not reach %q within %v", id, got.Status, want, timeout)
+}
+
+func TestRetryEventuallyFails(t *testing.T) {
+	q := NewQueue("jobs", WithMaxRetries(2), WithBackoff(time.Millisecond, 5*time.Millisecond))
+	var calls int64
+	q.Register("flap", func(Task) error {
+		atomic.AddInt64(&calls, 1)
+		return errors.New("nope")
+	})
+
+	q.Start(1)
+	defer q.Stop()
+
+	id, _ := q.Enqueue("flap", nil)
+	waitForStatus(t, q, id, StatusFailed, 2*time.Second)
+
+	if got := atomic.LoadInt64(&calls); got != 3 {
+		t.Fatalf("handler called %d times, want 3 (1 initial + 2 retries)", got)
+	}
+	if got, _ := q.GetTask(id); got.Retries != 2 {
+		t.Fatalf("Retries = %d, want 2", got.Retries)
+	}
+}
+
+func TestRetrySucceedsAfterFailure(t *testing.T) {
+	q := NewQueue("jobs", WithMaxRetries(3), WithBackoff(time.Millisecond, 5*time.Millisecond))
+	var calls int64
+	q.Register("flap", func(Task) error {
+		if atomic.AddInt64(&calls, 1) == 1 {
+			return errors.New("first attempt fails")
+		}
+		return nil
+	})
+
+	q.Start(1)
+	defer q.Stop()
+
+	id, _ := q.Enqueue("flap", nil)
+	waitForStatus(t, q, id, StatusCompleted, 2*time.Second)
+
+	if got := atomic.LoadInt64(&calls); got != 2 {
+		t.Fatalf("handler called %d times, want 2", got)
+	}
+	if got, _ := q.GetTask(id); got.Retries != 1 {
+		t.Fatalf("Retries = %d, want 1", got.Retries)
+	}
+}
+
+func TestEnqueueDelayedStartsScheduled(t *testing.T) {
+	q := NewQueue("jobs")
+	id, err := q.EnqueueDelayed("job", nil, time.Hour)
+	if err != nil {
+		t.Fatalf("EnqueueDelayed error: %v", err)
+	}
+	got, ok := q.GetTask(id)
+	if !ok {
+		t.Fatalf("GetTask(%q) not found", id)
+	}
+	if got.Status != StatusScheduled {
+		t.Fatalf("delayed task status: got %q, want %q", got.Status, StatusScheduled)
+	}
+}
+
+func TestEnqueueDelayedRunsAfterDelay(t *testing.T) {
+	q := NewQueue("jobs")
+	const delay = 40 * time.Millisecond
+
+	ran := make(chan time.Duration, 1)
+	start := time.Now()
+	q.Register("job", func(Task) error {
+		ran <- time.Since(start)
+		return nil
+	})
+
+	q.Start(2)
+	defer q.Stop()
+
+	if _, err := q.EnqueueDelayed("job", nil, delay); err != nil {
+		t.Fatalf("EnqueueDelayed error: %v", err)
+	}
+
+	select {
+	case elapsed := <-ran:
+		if elapsed < delay {
+			t.Fatalf("delayed task ran after %v, want >= %v", elapsed, delay)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("delayed task never ran")
+	}
+}
+
+func TestProcessNextPromotesDueDelayed(t *testing.T) {
+	q := NewQueue("jobs")
+	var ran bool
+	q.Register("job", func(Task) error { ran = true; return nil })
+
+	q.EnqueueDelayed("job", nil, 0) // due immediately
+
+	processed, err := q.ProcessNext()
+	if err != nil {
+		t.Fatalf("ProcessNext error: %v", err)
+	}
+	if !processed {
+		t.Fatal("ProcessNext should have promoted and run the due delayed task")
+	}
+	if !ran {
+		t.Fatal("handler did not run")
+	}
 }
 
 // itoa is a tiny helper so tests don't depend on strconv for labels.
