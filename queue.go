@@ -362,9 +362,13 @@ func (q *Queue) retryOrFail(t *Task) {
 }
 
 func (q *Queue) backoff(retries int) time.Duration {
-	d := q.backoffBase << (retries - 1)
-	if d <= 0 || d > q.backoffMax {
-		d = q.backoffMax
+	return expBackoff(q.backoffBase, q.backoffMax, retries)
+}
+
+func expBackoff(base, max time.Duration, retries int) time.Duration {
+	d := base << (retries - 1)
+	if d <= 0 || d > max {
+		d = max
 	}
 	return d
 }
