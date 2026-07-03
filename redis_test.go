@@ -45,6 +45,45 @@ func TestRedisEnqueueGetTask(t *testing.T) {
 	}
 }
 
+func TestRedisEnqueueRegistersAndQueuesTogether(t *testing.T) {
+	client := newTestRedis(t)
+	q := NewRedisQueue(client, "jobs")
+	ctx := context.Background()
+
+	id, err := q.Enqueue("job", []byte("x"))
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if got, ok, _ := q.GetTask(id); !ok || got.Status != StatusPending {
+		t.Fatalf("task not registered as pending: ok=%v status=%q", ok, got.Status)
+	}
+	ready, _ := client.LRange(ctx, q.readyKey(), 0, -1).Result()
+	if !contains(ready, id) {
+		t.Fatalf("id %s not in ready list %v", id, ready)
+	}
+
+	did, err := q.EnqueueDelayed("job", nil, time.Hour)
+	if err != nil {
+		t.Fatalf("EnqueueDelayed: %v", err)
+	}
+	if got, ok, _ := q.GetTask(did); !ok || got.Status != StatusScheduled {
+		t.Fatalf("delayed task not registered as scheduled: ok=%v status=%q", ok, got.Status)
+	}
+	sched, _ := client.ZRange(ctx, q.delayedKey(), 0, -1).Result()
+	if !contains(sched, did) {
+		t.Fatalf("id %s not in delayed set %v", did, sched)
+	}
+}
+
+func contains(s []string, v string) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
 func TestRedisEnqueueEmptyType(t *testing.T) {
 	q := NewRedisQueue(newTestRedis(t), "jobs")
 	if _, err := q.Enqueue("", nil); err == nil {

@@ -105,11 +105,19 @@ func (q *RedisQueue) deadlineKey() string        { return q.name + ":deadlines" 
 func (q *RedisQueue) cancelKey(id string) string { return q.name + ":cancel:" + id }
 
 func (q *RedisQueue) Enqueue(taskType string, data []byte) (string, error) {
-	t, err := q.newTask(context.Background(), taskType, data, StatusPending)
+	ctx := context.Background()
+	t, b, err := q.newTask(ctx, taskType, data, StatusPending)
 	if err != nil {
 		return "", err
 	}
-	if err := q.client.LPush(context.Background(), q.readyKey(), t.ID).Err(); err != nil {
+	// Register the task and make it runnable atomically, so a failure can't
+	// leave a task in the registry that is in no ready list.
+	_, err = q.client.TxPipelined(ctx, func(p redis.Pipeliner) error {
+		p.HSet(ctx, q.tasksKey(), t.ID, b)
+		p.LPush(ctx, q.readyKey(), t.ID)
+		return nil
+	})
+	if err != nil {
 		return "", err
 	}
 	return t.ID, nil
@@ -117,23 +125,30 @@ func (q *RedisQueue) Enqueue(taskType string, data []byte) (string, error) {
 
 func (q *RedisQueue) EnqueueDelayed(taskType string, data []byte, delay time.Duration) (string, error) {
 	ctx := context.Background()
-	t, err := q.newTask(ctx, taskType, data, StatusScheduled)
+	t, b, err := q.newTask(ctx, taskType, data, StatusScheduled)
 	if err != nil {
 		return "", err
 	}
-	if err := q.schedule(ctx, t.ID, time.Now().Add(delay)); err != nil {
+	_, err = q.client.TxPipelined(ctx, func(p redis.Pipeliner) error {
+		p.HSet(ctx, q.tasksKey(), t.ID, b)
+		p.ZAdd(ctx, q.delayedKey(), redis.Z{Score: unixScore(time.Now().Add(delay)), Member: t.ID})
+		return nil
+	})
+	if err != nil {
 		return "", err
 	}
 	return t.ID, nil
 }
 
-func (q *RedisQueue) newTask(ctx context.Context, taskType string, data []byte, status TaskStatus) (*Task, error) {
+// newTask allocates an ID and builds a task with its marshaled form. It does not
+// write anything; the caller registers and enqueues it atomically.
+func (q *RedisQueue) newTask(ctx context.Context, taskType string, data []byte, status TaskStatus) (*Task, []byte, error) {
 	if taskType == "" {
-		return nil, errors.New("task type cannot be empty")
+		return nil, nil, errors.New("task type cannot be empty")
 	}
 	n, err := q.client.Incr(ctx, q.seqKey()).Result()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	t := &Task{
 		ID:         strconv.FormatInt(n, 10),
@@ -143,10 +158,11 @@ func (q *RedisQueue) newTask(ctx context.Context, taskType string, data []byte, 
 		CreatedAt:  time.Now(),
 		MaxRetries: q.maxRetries,
 	}
-	if err := q.save(ctx, t); err != nil {
-		return nil, err
+	b, err := json.Marshal(t)
+	if err != nil {
+		return nil, nil, err
 	}
-	return t, nil
+	return t, b, nil
 }
 
 func (q *RedisQueue) Register(taskType string, h Handler) {
