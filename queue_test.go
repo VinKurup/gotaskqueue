@@ -12,7 +12,7 @@ import (
 // --- Ring buffer mechanics (via the unexported dequeue) ---
 
 func TestEnqueueDequeueRoundTrip(t *testing.T) {
-	q := NewQueue("jobs")
+	q := NewMemoryQueue("jobs")
 
 	id, err := q.Enqueue("send_email", []byte("hello"))
 	if err != nil {
@@ -32,7 +32,7 @@ func TestEnqueueDequeueRoundTrip(t *testing.T) {
 }
 
 func TestFIFOOrder(t *testing.T) {
-	q := NewQueue("jobs")
+	q := NewMemoryQueue("jobs")
 	types := []string{"a", "b", "c"}
 	for _, ty := range types {
 		if _, err := q.Enqueue(ty, nil); err != nil {
@@ -52,7 +52,7 @@ func TestFIFOOrder(t *testing.T) {
 }
 
 func TestGrowBeyondBaseCapacity(t *testing.T) {
-	q := NewQueue("jobs")
+	q := NewMemoryQueue("jobs")
 	const n = 50 // well past the base capacity of 8
 
 	for i := 0; i < n; i++ {
@@ -71,7 +71,7 @@ func TestGrowBeyondBaseCapacity(t *testing.T) {
 }
 
 func TestWraparound(t *testing.T) {
-	q := NewQueue("jobs")
+	q := NewMemoryQueue("jobs")
 
 	// Fill, drain part way, then refill so tail wraps past head.
 	for i := 0; i < 8; i++ {
@@ -102,14 +102,14 @@ func TestWraparound(t *testing.T) {
 }
 
 func TestDequeueEmpty(t *testing.T) {
-	q := NewQueue("jobs")
+	q := NewMemoryQueue("jobs")
 	if got := q.dequeue(); got != nil {
 		t.Fatalf("dequeue on empty queue returned %+v", got)
 	}
 }
 
 func TestConcurrentEnqueue(t *testing.T) {
-	q := NewQueue("jobs")
+	q := NewMemoryQueue("jobs")
 	const n = 100
 
 	var wg sync.WaitGroup
@@ -134,10 +134,10 @@ func TestConcurrentEnqueue(t *testing.T) {
 // --- Status + worker loop ---
 
 func TestEnqueueStartsPending(t *testing.T) {
-	q := NewQueue("jobs")
+	q := NewMemoryQueue("jobs")
 	id, _ := q.Enqueue("send_email", nil)
 
-	got, ok := q.GetTask(id)
+	got, ok, _ := q.GetTask(id)
 	if !ok {
 		t.Fatalf("GetTask(%q) not found", id)
 	}
@@ -150,14 +150,14 @@ func TestEnqueueStartsPending(t *testing.T) {
 }
 
 func TestEnqueueEmptyType(t *testing.T) {
-	q := NewQueue("jobs")
+	q := NewMemoryQueue("jobs")
 	if _, err := q.Enqueue("", nil); err == nil {
 		t.Fatal("Enqueue with empty type should return an error")
 	}
 }
 
 func TestProcessNextRunsHandler(t *testing.T) {
-	q := NewQueue("jobs")
+	q := NewMemoryQueue("jobs")
 
 	var gotData string
 	q.Register("greet", func(_ context.Context, task Task) error {
@@ -178,14 +178,14 @@ func TestProcessNextRunsHandler(t *testing.T) {
 		t.Fatalf("handler saw data %q, want %q", gotData, "hi")
 	}
 
-	got, _ := q.GetTask(id)
+	got, _, _ := q.GetTask(id)
 	if got.Status != StatusCompleted {
 		t.Fatalf("task status after success: got %q, want %q", got.Status, StatusCompleted)
 	}
 }
 
 func TestProcessNextHandlerError(t *testing.T) {
-	q := NewQueue("jobs", WithMaxRetries(0)) // no retries: one failure is terminal
+	q := NewMemoryQueue("jobs", WithMaxRetries(0)) // no retries: one failure is terminal
 	boom := errors.New("boom")
 	q.Register("fail", func(context.Context, Task) error { return boom })
 
@@ -199,14 +199,14 @@ func TestProcessNextHandlerError(t *testing.T) {
 		t.Fatalf("ProcessNext error: got %v, want %v", err, boom)
 	}
 
-	got, _ := q.GetTask(id)
+	got, _, _ := q.GetTask(id)
 	if got.Status != StatusFailed {
 		t.Fatalf("task status after handler error: got %q, want %q", got.Status, StatusFailed)
 	}
 }
 
 func TestProcessNextNoHandler(t *testing.T) {
-	q := NewQueue("jobs")
+	q := NewMemoryQueue("jobs")
 	id, _ := q.Enqueue("orphan", nil)
 
 	processed, err := q.ProcessNext()
@@ -217,14 +217,14 @@ func TestProcessNextNoHandler(t *testing.T) {
 		t.Fatal("ProcessNext should error when no handler is registered")
 	}
 
-	got, _ := q.GetTask(id)
+	got, _, _ := q.GetTask(id)
 	if got.Status != StatusFailed {
 		t.Fatalf("task status with no handler: got %q, want %q", got.Status, StatusFailed)
 	}
 }
 
 func TestProcessNextEmpty(t *testing.T) {
-	q := NewQueue("jobs")
+	q := NewMemoryQueue("jobs")
 	processed, err := q.ProcessNext()
 	if processed {
 		t.Fatal("ProcessNext on empty queue should report processed=false")
@@ -237,7 +237,7 @@ func TestProcessNextEmpty(t *testing.T) {
 // --- Background workers ---
 
 func TestWorkersProcessAll(t *testing.T) {
-	q := NewQueue("jobs")
+	q := NewMemoryQueue("jobs")
 
 	var count int64
 	var wg sync.WaitGroup
@@ -267,7 +267,7 @@ func TestWorkersProcessAll(t *testing.T) {
 		t.Fatalf("handler ran %d times, want %d", got, n)
 	}
 	for _, id := range ids {
-		got, _ := q.GetTask(id)
+		got, _, _ := q.GetTask(id)
 		if got.Status != StatusCompleted {
 			t.Fatalf("task %s status: got %q, want %q", id, got.Status, StatusCompleted)
 		}
@@ -275,7 +275,7 @@ func TestWorkersProcessAll(t *testing.T) {
 }
 
 func TestStopDrainsBacklog(t *testing.T) {
-	q := NewQueue("jobs")
+	q := NewMemoryQueue("jobs")
 
 	release := make(chan struct{})
 	started := make(chan struct{}, 1)
@@ -317,7 +317,7 @@ func TestStopDrainsBacklog(t *testing.T) {
 }
 
 func TestEnqueueAfterStop(t *testing.T) {
-	q := NewQueue("jobs")
+	q := NewMemoryQueue("jobs")
 	q.Start(1)
 	q.Stop()
 
@@ -327,7 +327,7 @@ func TestEnqueueAfterStop(t *testing.T) {
 }
 
 func TestStopIsIdempotent(t *testing.T) {
-	q := NewQueue("jobs")
+	q := NewMemoryQueue("jobs")
 	q.Start(2)
 	q.Stop()
 	q.Stop() // must not panic or hang
@@ -335,21 +335,21 @@ func TestStopIsIdempotent(t *testing.T) {
 
 // --- Retries + backoff, delayed enqueue ---
 
-func waitForStatus(t *testing.T, q *Queue, id string, want TaskStatus, timeout time.Duration) {
+func waitForStatus(t *testing.T, q *MemoryQueue, id string, want TaskStatus, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if got, ok := q.GetTask(id); ok && got.Status == want {
+		if got, ok, _ := q.GetTask(id); ok && got.Status == want {
 			return
 		}
 		time.Sleep(time.Millisecond)
 	}
-	got, _ := q.GetTask(id)
+	got, _, _ := q.GetTask(id)
 	t.Fatalf("task %s: status %q did not reach %q within %v", id, got.Status, want, timeout)
 }
 
 func TestRetryEventuallyFails(t *testing.T) {
-	q := NewQueue("jobs", WithMaxRetries(2), WithBackoff(time.Millisecond, 5*time.Millisecond))
+	q := NewMemoryQueue("jobs", WithMaxRetries(2), WithBackoff(time.Millisecond, 5*time.Millisecond))
 	var calls int64
 	q.Register("flap", func(context.Context, Task) error {
 		atomic.AddInt64(&calls, 1)
@@ -365,13 +365,13 @@ func TestRetryEventuallyFails(t *testing.T) {
 	if got := atomic.LoadInt64(&calls); got != 3 {
 		t.Fatalf("handler called %d times, want 3 (1 initial + 2 retries)", got)
 	}
-	if got, _ := q.GetTask(id); got.Retries != 2 {
+	if got, _, _ := q.GetTask(id); got.Retries != 2 {
 		t.Fatalf("Retries = %d, want 2", got.Retries)
 	}
 }
 
 func TestRetrySucceedsAfterFailure(t *testing.T) {
-	q := NewQueue("jobs", WithMaxRetries(3), WithBackoff(time.Millisecond, 5*time.Millisecond))
+	q := NewMemoryQueue("jobs", WithMaxRetries(3), WithBackoff(time.Millisecond, 5*time.Millisecond))
 	var calls int64
 	q.Register("flap", func(context.Context, Task) error {
 		if atomic.AddInt64(&calls, 1) == 1 {
@@ -389,18 +389,18 @@ func TestRetrySucceedsAfterFailure(t *testing.T) {
 	if got := atomic.LoadInt64(&calls); got != 2 {
 		t.Fatalf("handler called %d times, want 2", got)
 	}
-	if got, _ := q.GetTask(id); got.Retries != 1 {
+	if got, _, _ := q.GetTask(id); got.Retries != 1 {
 		t.Fatalf("Retries = %d, want 1", got.Retries)
 	}
 }
 
 func TestEnqueueDelayedStartsScheduled(t *testing.T) {
-	q := NewQueue("jobs")
+	q := NewMemoryQueue("jobs")
 	id, err := q.EnqueueDelayed("job", nil, time.Hour)
 	if err != nil {
 		t.Fatalf("EnqueueDelayed error: %v", err)
 	}
-	got, ok := q.GetTask(id)
+	got, ok, _ := q.GetTask(id)
 	if !ok {
 		t.Fatalf("GetTask(%q) not found", id)
 	}
@@ -410,7 +410,7 @@ func TestEnqueueDelayedStartsScheduled(t *testing.T) {
 }
 
 func TestEnqueueDelayedRunsAfterDelay(t *testing.T) {
-	q := NewQueue("jobs")
+	q := NewMemoryQueue("jobs")
 	const delay = 40 * time.Millisecond
 
 	ran := make(chan time.Duration, 1)
@@ -438,7 +438,7 @@ func TestEnqueueDelayedRunsAfterDelay(t *testing.T) {
 }
 
 func TestProcessNextPromotesDueDelayed(t *testing.T) {
-	q := NewQueue("jobs")
+	q := NewMemoryQueue("jobs")
 	var ran bool
 	q.Register("job", func(context.Context, Task) error { ran = true; return nil })
 
@@ -457,7 +457,7 @@ func TestProcessNextPromotesDueDelayed(t *testing.T) {
 }
 
 func TestCancelInFlightHandler(t *testing.T) {
-	q := NewQueue("jobs", WithMaxRetries(3))
+	q := NewMemoryQueue("jobs", WithMaxRetries(3))
 
 	entered := make(chan struct{})
 	var ctxErr error
@@ -476,7 +476,7 @@ func TestCancelInFlightHandler(t *testing.T) {
 	id, _ := q.Enqueue("slow", nil)
 	<-entered // handler is running
 
-	if !q.Cancel(id) {
+	if ok, _ := q.Cancel(id); !ok {
 		t.Fatal("Cancel on a running task returned false")
 	}
 
@@ -493,7 +493,7 @@ func TestCancelInFlightHandler(t *testing.T) {
 
 	// A cancelled in-flight task must not be retried.
 	time.Sleep(20 * time.Millisecond)
-	if got, _ := q.GetTask(id); got.Status != StatusCancelled {
+	if got, _, _ := q.GetTask(id); got.Status != StatusCancelled {
 		t.Fatalf("cancelled task was retried/changed: status %q", got.Status)
 	}
 }
@@ -501,7 +501,7 @@ func TestCancelInFlightHandler(t *testing.T) {
 // --- Stats + cancellation ---
 
 func TestStatsCounts(t *testing.T) {
-	q := NewQueue("jobs", WithMaxRetries(0))
+	q := NewMemoryQueue("jobs", WithMaxRetries(0))
 	q.Register("ok", func(context.Context, Task) error { return nil })
 	q.Register("bad", func(context.Context, Task) error { return errors.New("x") })
 
@@ -516,7 +516,7 @@ func TestStatsCounts(t *testing.T) {
 	q.Enqueue("ok", nil)                   // stays pending
 	q.EnqueueDelayed("ok", nil, time.Hour) // stays scheduled
 
-	s := q.Stats()
+	s, _ := q.Stats()
 	if s.Total != 5 {
 		t.Fatalf("Total = %d, want 5", s.Total)
 	}
@@ -526,15 +526,15 @@ func TestStatsCounts(t *testing.T) {
 }
 
 func TestCancelPendingSkipsExecution(t *testing.T) {
-	q := NewQueue("jobs")
+	q := NewMemoryQueue("jobs")
 	var ran bool
 	q.Register("job", func(context.Context, Task) error { ran = true; return nil })
 
 	id, _ := q.Enqueue("job", nil)
-	if !q.Cancel(id) {
+	if ok, _ := q.Cancel(id); !ok {
 		t.Fatal("Cancel(pending) returned false")
 	}
-	if got, _ := q.GetTask(id); got.Status != StatusCancelled {
+	if got, _, _ := q.GetTask(id); got.Status != StatusCancelled {
 		t.Fatalf("status after cancel: got %q, want %q", got.Status, StatusCancelled)
 	}
 
@@ -548,40 +548,40 @@ func TestCancelPendingSkipsExecution(t *testing.T) {
 }
 
 func TestCancelScheduled(t *testing.T) {
-	q := NewQueue("jobs")
+	q := NewMemoryQueue("jobs")
 	id, _ := q.EnqueueDelayed("job", nil, time.Hour)
 
-	if !q.Cancel(id) {
+	if ok, _ := q.Cancel(id); !ok {
 		t.Fatal("Cancel(scheduled) returned false")
 	}
-	if got, _ := q.GetTask(id); got.Status != StatusCancelled {
+	if got, _, _ := q.GetTask(id); got.Status != StatusCancelled {
 		t.Fatalf("status after cancel: got %q, want %q", got.Status, StatusCancelled)
 	}
 }
 
 func TestCancelCompletedReturnsFalse(t *testing.T) {
-	q := NewQueue("jobs")
+	q := NewMemoryQueue("jobs")
 	q.Register("job", func(context.Context, Task) error { return nil })
 	id, _ := q.Enqueue("job", nil)
 	q.ProcessNext()
 
-	if q.Cancel(id) {
+	if ok, _ := q.Cancel(id); ok {
 		t.Fatal("Cancel on a completed task should return false")
 	}
-	if got, _ := q.GetTask(id); got.Status != StatusCompleted {
+	if got, _, _ := q.GetTask(id); got.Status != StatusCompleted {
 		t.Fatalf("status changed after late cancel: got %q", got.Status)
 	}
 }
 
 func TestCancelUnknownReturnsFalse(t *testing.T) {
-	q := NewQueue("jobs")
-	if q.Cancel("nope") {
+	q := NewMemoryQueue("jobs")
+	if ok, _ := q.Cancel("nope"); ok {
 		t.Fatal("Cancel on unknown id should return false")
 	}
 }
 
 func TestWorkerSkipsCancelled(t *testing.T) {
-	q := NewQueue("jobs")
+	q := NewMemoryQueue("jobs")
 	var ranCancelled int64
 	done := make(chan struct{})
 	q.Register("cancel", func(context.Context, Task) error { atomic.AddInt64(&ranCancelled, 1); return nil })
@@ -607,27 +607,27 @@ func TestWorkerSkipsCancelled(t *testing.T) {
 // --- Registry cleanup / TTL ---
 
 func TestCleanupEvictsExpiredTerminal(t *testing.T) {
-	q := NewQueue("jobs", WithTaskTTL(time.Millisecond))
+	q := NewMemoryQueue("jobs", WithTaskTTL(time.Millisecond))
 	q.Register("ok", func(context.Context, Task) error { return nil })
 
 	id, _ := q.Enqueue("ok", nil)
 	q.ProcessNext()
-	if got, _ := q.GetTask(id); got.Status != StatusCompleted {
+	if got, _, _ := q.GetTask(id); got.Status != StatusCompleted {
 		t.Fatalf("task not completed: %q", got.Status)
 	}
 
 	time.Sleep(5 * time.Millisecond)
 
-	if n := q.Cleanup(); n != 1 {
+	if n, _ := q.Cleanup(); n != 1 {
 		t.Fatalf("Cleanup purged %d, want 1", n)
 	}
-	if _, ok := q.GetTask(id); ok {
+	if _, ok, _ := q.GetTask(id); ok {
 		t.Fatal("task still in registry after cleanup")
 	}
 }
 
 func TestCleanupKeepsLiveAndFresh(t *testing.T) {
-	q := NewQueue("jobs", WithTaskTTL(time.Hour))
+	q := NewMemoryQueue("jobs", WithTaskTTL(time.Hour))
 	q.Register("ok", func(context.Context, Task) error { return nil })
 
 	done, _ := q.Enqueue("ok", nil)
@@ -635,18 +635,18 @@ func TestCleanupKeepsLiveAndFresh(t *testing.T) {
 	pending, _ := q.Enqueue("ok", nil)
 	sched, _ := q.EnqueueDelayed("ok", nil, time.Hour)
 
-	if n := q.Cleanup(); n != 0 {
+	if n, _ := q.Cleanup(); n != 0 {
 		t.Fatalf("Cleanup purged %d, want 0", n)
 	}
 	for _, id := range []string{done, pending, sched} {
-		if _, ok := q.GetTask(id); !ok {
+		if _, ok, _ := q.GetTask(id); !ok {
 			t.Fatalf("task %s was wrongly purged", id)
 		}
 	}
 }
 
 func TestCleanupLoopEvicts(t *testing.T) {
-	q := NewQueue("jobs", WithTaskTTL(time.Millisecond), WithCleanupInterval(5*time.Millisecond))
+	q := NewMemoryQueue("jobs", WithTaskTTL(time.Millisecond), WithCleanupInterval(5*time.Millisecond))
 	q.Register("ok", func(context.Context, Task) error { return nil })
 
 	q.Start(1)
@@ -657,7 +657,7 @@ func TestCleanupLoopEvicts(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, ok := q.GetTask(id); !ok {
+		if _, ok, _ := q.GetTask(id); !ok {
 			return
 		}
 		time.Sleep(2 * time.Millisecond)

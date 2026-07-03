@@ -44,28 +44,46 @@ type Task struct {
 
 type Handler func(context.Context, Task) error
 
-type Option func(*Queue)
+type Queue interface {
+	Enqueue(taskType string, data []byte) (string, error)
+	EnqueueDelayed(taskType string, data []byte, delay time.Duration) (string, error)
+	Register(taskType string, h Handler)
+	Start(workers int)
+	Stop()
+	ProcessNext() (bool, error)
+	GetTask(id string) (Task, bool, error)
+	Cancel(id string) (bool, error)
+	Stats() (Stats, error)
+	Cleanup() (int, error)
+}
+
+var (
+	_ Queue = (*MemoryQueue)(nil)
+	_ Queue = (*RedisQueue)(nil)
+)
+
+type Option func(*MemoryQueue)
 
 func WithMaxRetries(n int) Option {
-	return func(q *Queue) { q.maxRetries = n }
+	return func(q *MemoryQueue) { q.maxRetries = n }
 }
 
 func WithBackoff(base, max time.Duration) Option {
-	return func(q *Queue) {
+	return func(q *MemoryQueue) {
 		q.backoffBase = base
 		q.backoffMax = max
 	}
 }
 
 func WithTaskTTL(d time.Duration) Option {
-	return func(q *Queue) { q.taskTTL = d }
+	return func(q *MemoryQueue) { q.taskTTL = d }
 }
 
 func WithCleanupInterval(d time.Duration) Option {
-	return func(q *Queue) { q.cleanupInterval = d }
+	return func(q *MemoryQueue) { q.cleanupInterval = d }
 }
 
-type Queue struct {
+type MemoryQueue struct {
 	name            string
 	mu              sync.Mutex
 	cond            *sync.Cond
@@ -90,8 +108,8 @@ type Queue struct {
 	wg              sync.WaitGroup
 }
 
-func NewQueue(name string, opts ...Option) *Queue {
-	q := &Queue{
+func NewMemoryQueue(name string, opts ...Option) *MemoryQueue {
+	q := &MemoryQueue{
 		name:            name,
 		wake:            make(chan struct{}, 1),
 		tasks:           make(map[string]*Task),
@@ -111,7 +129,7 @@ func NewQueue(name string, opts ...Option) *Queue {
 	return q
 }
 
-func (q *Queue) Enqueue(taskType string, data []byte) (string, error) {
+func (q *MemoryQueue) Enqueue(taskType string, data []byte) (string, error) {
 	if taskType == "" {
 		return "", errors.New("task type cannot be empty")
 	}
@@ -128,7 +146,7 @@ func (q *Queue) Enqueue(taskType string, data []byte) (string, error) {
 	return t.ID, nil
 }
 
-func (q *Queue) EnqueueDelayed(taskType string, data []byte, delay time.Duration) (string, error) {
+func (q *MemoryQueue) EnqueueDelayed(taskType string, data []byte, delay time.Duration) (string, error) {
 	if taskType == "" {
 		return "", errors.New("task type cannot be empty")
 	}
@@ -145,7 +163,7 @@ func (q *Queue) EnqueueDelayed(taskType string, data []byte, delay time.Duration
 	return t.ID, nil
 }
 
-func (q *Queue) buildTask(taskType string, data []byte, status TaskStatus) *Task {
+func (q *MemoryQueue) buildTask(taskType string, data []byte, status TaskStatus) *Task {
 	q.idSeq++
 	t := &Task{
 		ID:         strconv.FormatInt(q.idSeq, 10),
@@ -159,13 +177,13 @@ func (q *Queue) buildTask(taskType string, data []byte, status TaskStatus) *Task
 	return t
 }
 
-func (q *Queue) Register(taskType string, h Handler) {
+func (q *MemoryQueue) Register(taskType string, h Handler) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.handlers[taskType] = h
 }
 
-func (q *Queue) Start(workers int) {
+func (q *MemoryQueue) Start(workers int) {
 	if workers < 1 {
 		workers = 1
 	}
@@ -186,7 +204,7 @@ func (q *Queue) Start(workers int) {
 	go q.cleanupLoop()
 }
 
-func (q *Queue) Stop() {
+func (q *MemoryQueue) Stop() {
 	q.mu.Lock()
 	if q.stopped {
 		q.mu.Unlock()
@@ -201,7 +219,7 @@ func (q *Queue) Stop() {
 	q.wg.Wait()
 }
 
-func (q *Queue) cleanupLoop() {
+func (q *MemoryQueue) cleanupLoop() {
 	defer q.wg.Done()
 	ticker := time.NewTicker(q.cleanupInterval)
 	defer ticker.Stop()
@@ -215,7 +233,7 @@ func (q *Queue) cleanupLoop() {
 	}
 }
 
-func (q *Queue) worker() {
+func (q *MemoryQueue) worker() {
 	defer q.wg.Done()
 	for {
 		t := q.waitAndPop()
@@ -226,7 +244,7 @@ func (q *Queue) worker() {
 	}
 }
 
-func (q *Queue) waitAndPop() *Task {
+func (q *MemoryQueue) waitAndPop() *Task {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	for {
@@ -244,7 +262,7 @@ func (q *Queue) waitAndPop() *Task {
 	}
 }
 
-func (q *Queue) scheduler() {
+func (q *MemoryQueue) scheduler() {
 	defer q.wg.Done()
 	for {
 		q.mu.Lock()
@@ -273,7 +291,7 @@ func (q *Queue) scheduler() {
 	}
 }
 
-func (q *Queue) promoteDue() int {
+func (q *MemoryQueue) promoteDue() int {
 	now := time.Now()
 	n := 0
 	for st := q.delayed.peek(); st != nil && !st.runAt.After(now); st = q.delayed.peek() {
@@ -288,14 +306,14 @@ func (q *Queue) promoteDue() int {
 	return n
 }
 
-func (q *Queue) wakeScheduler() {
+func (q *MemoryQueue) wakeScheduler() {
 	select {
 	case q.wake <- struct{}{}:
 	default:
 	}
 }
 
-func (q *Queue) ProcessNext() (processed bool, err error) {
+func (q *MemoryQueue) ProcessNext() (processed bool, err error) {
 	q.mu.Lock()
 	q.promoteDue()
 	var t *Task
@@ -312,7 +330,7 @@ func (q *Queue) ProcessNext() (processed bool, err error) {
 	return true, q.runTask(t)
 }
 
-func (q *Queue) runTask(t *Task) error {
+func (q *MemoryQueue) runTask(t *Task) error {
 	q.mu.Lock()
 	t.Status = StatusProcessing
 	h, ok := q.handlers[t.Type]
@@ -347,7 +365,7 @@ func (q *Queue) runTask(t *Task) error {
 	return nil
 }
 
-func (q *Queue) retryOrFail(t *Task) {
+func (q *MemoryQueue) retryOrFail(t *Task) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if t.Retries < t.MaxRetries {
@@ -361,7 +379,7 @@ func (q *Queue) retryOrFail(t *Task) {
 	t.FinishedAt = time.Now()
 }
 
-func (q *Queue) backoff(retries int) time.Duration {
+func (q *MemoryQueue) backoff(retries int) time.Duration {
 	return expBackoff(q.backoffBase, q.backoffMax, retries)
 }
 
@@ -373,17 +391,17 @@ func expBackoff(base, max time.Duration, retries int) time.Duration {
 	return d
 }
 
-func (q *Queue) GetTask(id string) (Task, bool) {
+func (q *MemoryQueue) GetTask(id string) (Task, bool, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	t, ok := q.tasks[id]
 	if !ok {
-		return Task{}, false
+		return Task{}, false, nil
 	}
-	return *t, true
+	return *t, true, nil
 }
 
-func (q *Queue) setStatus(t *Task, s TaskStatus) {
+func (q *MemoryQueue) setStatus(t *Task, s TaskStatus) {
 	q.mu.Lock()
 	t.Status = s
 	if s == StatusCompleted || s == StatusFailed {
@@ -392,34 +410,34 @@ func (q *Queue) setStatus(t *Task, s TaskStatus) {
 	q.mu.Unlock()
 }
 
-func (q *Queue) Cancel(id string) bool {
+func (q *MemoryQueue) Cancel(id string) (bool, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	t, ok := q.tasks[id]
 	if !ok {
-		return false
+		return false, nil
 	}
 	switch t.Status {
 	case StatusPending, StatusScheduled:
 		t.Status = StatusCancelled
 		t.FinishedAt = time.Now()
-		return true
+		return true, nil
 	case StatusProcessing:
 		if cancel, ok := q.inflight[t.ID]; ok {
 			cancel()
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
-func (q *Queue) Cleanup() int {
+func (q *MemoryQueue) Cleanup() (int, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return q.purgeExpired(time.Now())
+	return q.purgeExpired(time.Now()), nil
 }
 
-func (q *Queue) purgeExpired(now time.Time) int {
+func (q *MemoryQueue) purgeExpired(now time.Time) int {
 	n := 0
 	for id, t := range q.tasks {
 		if isTerminal(t.Status) && now.Sub(t.FinishedAt) > q.taskTTL {
@@ -444,7 +462,7 @@ type Stats struct {
 	Total      int
 }
 
-func (q *Queue) Stats() Stats {
+func (q *MemoryQueue) Stats() (Stats, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	var s Stats
@@ -465,10 +483,10 @@ func (q *Queue) Stats() Stats {
 			s.Cancelled++
 		}
 	}
-	return s
+	return s, nil
 }
 
-func (q *Queue) push(t *Task) {
+func (q *MemoryQueue) push(t *Task) {
 	if q.count == len(q.items) {
 		q.grow()
 	}
@@ -477,7 +495,7 @@ func (q *Queue) push(t *Task) {
 	q.count++
 }
 
-func (q *Queue) dequeue() *Task {
+func (q *MemoryQueue) dequeue() *Task {
 	if q.count == 0 {
 		return nil
 	}
@@ -488,7 +506,7 @@ func (q *Queue) dequeue() *Task {
 	return t
 }
 
-func (q *Queue) grow() {
+func (q *MemoryQueue) grow() {
 	newCap := len(q.items) * 2
 	if newCap == 0 {
 		newCap = baseCapacity
