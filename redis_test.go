@@ -335,6 +335,52 @@ func TestRedisCancelPending(t *testing.T) {
 	}
 }
 
+func TestRedisCancelInFlight(t *testing.T) {
+	q := NewRedisQueue(newTestRedis(t), "jobs",
+		WithRedisMaxRetries(3), WithRedisPollInterval(5*time.Millisecond))
+
+	entered := make(chan struct{})
+	finished := make(chan struct{})
+	var ctxErr error
+	q.Register("slow", func(ctx context.Context, _ Task) error {
+		close(entered)
+		<-ctx.Done()
+		ctxErr = ctx.Err()
+		close(finished)
+		return ctx.Err()
+	})
+
+	q.Start(1)
+	defer q.Stop()
+
+	id, _ := q.Enqueue("slow", nil)
+	<-entered
+
+	ok, err := q.Cancel(id)
+	if err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	if !ok {
+		t.Fatal("Cancel on a running task returned false")
+	}
+
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler was never cancelled")
+	}
+	if ctxErr == nil {
+		t.Fatal("handler's context was not cancelled")
+	}
+
+	waitForRedisStatus(t, q, id, StatusCancelled, 2*time.Second)
+
+	time.Sleep(30 * time.Millisecond)
+	if got, _, _ := q.GetTask(id); got.Status != StatusCancelled {
+		t.Fatalf("cancelled in-flight task was retried/changed: %q", got.Status)
+	}
+}
+
 func TestRedisCancelScheduled(t *testing.T) {
 	q := NewRedisQueue(newTestRedis(t), "jobs")
 	id, _ := q.EnqueueDelayed("job", nil, time.Hour)

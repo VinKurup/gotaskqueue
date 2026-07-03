@@ -13,6 +13,12 @@ import (
 
 const defaultRedisPoll = 20 * time.Millisecond
 
+const cancelSignalTTL = 5 * time.Minute
+
+const brpopTimeout = time.Second
+
+const stopSentinel = "__stop__"
+
 type RedisOption func(*RedisQueue)
 
 func WithRedisMaxRetries(n int) RedisOption {
@@ -51,6 +57,7 @@ type RedisQueue struct {
 	mu       sync.Mutex
 	handlers map[string]Handler
 	done     chan struct{}
+	workers  int
 	started  bool
 	stopped  bool
 	wg       sync.WaitGroup
@@ -75,10 +82,11 @@ func NewRedisQueue(client *redis.Client, name string, opts ...RedisOption) *Redi
 	return q
 }
 
-func (q *RedisQueue) readyKey() string   { return q.name + ":ready" }
-func (q *RedisQueue) tasksKey() string   { return q.name + ":tasks" }
-func (q *RedisQueue) delayedKey() string { return q.name + ":delayed" }
-func (q *RedisQueue) seqKey() string     { return q.name + ":seq" }
+func (q *RedisQueue) readyKey() string           { return q.name + ":ready" }
+func (q *RedisQueue) tasksKey() string           { return q.name + ":tasks" }
+func (q *RedisQueue) delayedKey() string         { return q.name + ":delayed" }
+func (q *RedisQueue) seqKey() string             { return q.name + ":seq" }
+func (q *RedisQueue) cancelKey(id string) string { return q.name + ":cancel:" + id }
 
 func (q *RedisQueue) Enqueue(taskType string, data []byte) (string, error) {
 	t, err := q.newTask(context.Background(), taskType, data, StatusPending)
@@ -167,6 +175,7 @@ func (q *RedisQueue) Start(workers int) {
 		return
 	}
 	q.started = true
+	q.workers = workers
 	for i := 0; i < workers; i++ {
 		q.wg.Add(1)
 		go q.worker()
@@ -185,7 +194,16 @@ func (q *RedisQueue) Stop() {
 	}
 	q.stopped = true
 	close(q.done)
+	n := q.workers
 	q.mu.Unlock()
+
+	if n > 0 {
+		sentinels := make([]interface{}, n)
+		for i := range sentinels {
+			sentinels[i] = stopSentinel
+		}
+		q.client.RPush(context.Background(), q.readyKey(), sentinels...)
+	}
 	q.wg.Wait()
 }
 
@@ -193,19 +211,26 @@ func (q *RedisQueue) worker() {
 	defer q.wg.Done()
 	ctx := context.Background()
 	for {
-		select {
-		case <-q.done:
-			return
-		default:
-		}
-		id, err := q.client.RPop(ctx, q.readyKey()).Result()
+		res, err := q.client.BRPop(ctx, brpopTimeout, q.readyKey()).Result()
 		if err != nil {
+			if err == redis.Nil {
+				select {
+				case <-q.done:
+					return
+				default:
+					continue
+				}
+			}
 			select {
 			case <-q.done:
 				return
 			case <-time.After(q.pollInterval):
 			}
 			continue
+		}
+		id := res[1]
+		if id == stopSentinel {
+			return
 		}
 		t, ok, err := q.getTask(ctx, id)
 		if err != nil || !ok || t.Status == StatusCancelled {
@@ -261,18 +286,52 @@ func (q *RedisQueue) runTask(ctx context.Context, t *Task) error {
 		return errors.New("no handler registered for task type " + t.Type)
 	}
 
+	q.client.Del(ctx, q.cancelKey(t.ID))
+	hctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	watchDone := make(chan struct{})
+	go q.watchCancel(t.ID, cancel, watchDone)
+
 	t.Status = StatusProcessing
 	if err := q.save(ctx, t); err != nil {
+		close(watchDone)
 		return err
 	}
 
-	herr := h(ctx, *t)
+	herr := h(hctx, *t)
+	close(watchDone)
+	q.client.Del(ctx, q.cancelKey(t.ID))
+
+	if hctx.Err() != nil {
+		t.Status = StatusCancelled
+		t.FinishedAt = time.Now()
+		_ = q.save(ctx, t)
+		return herr
+	}
 	if herr != nil {
 		return q.retryOrFail(ctx, t, herr)
 	}
 	t.Status = StatusCompleted
 	t.FinishedAt = time.Now()
 	return q.save(ctx, t)
+}
+
+func (q *RedisQueue) watchCancel(id string, cancel context.CancelFunc, done chan struct{}) {
+	ticker := time.NewTicker(q.pollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-q.done:
+			return
+		case <-ticker.C:
+			if n, err := q.client.Exists(context.Background(), q.cancelKey(id)).Result(); err == nil && n > 0 {
+				cancel()
+				return
+			}
+		}
+	}
 }
 
 func (q *RedisQueue) retryOrFail(ctx context.Context, t *Task, herr error) error {
@@ -297,9 +356,9 @@ func (q *RedisQueue) schedule(ctx context.Context, id string, runAt time.Time) e
 
 func (q *RedisQueue) Cancel(id string) (bool, error) {
 	ctx := context.Background()
-	cancelled := false
+	var status TaskStatus
 	txf := func(tx *redis.Tx) error {
-		cancelled = false
+		status = ""
 		b, err := tx.HGet(ctx, q.tasksKey(), id).Bytes()
 		if err == redis.Nil {
 			return nil
@@ -311,6 +370,7 @@ func (q *RedisQueue) Cancel(id string) (bool, error) {
 		if err := json.Unmarshal(b, &t); err != nil {
 			return err
 		}
+		status = t.Status
 		if t.Status != StatusPending && t.Status != StatusScheduled {
 			return nil
 		}
@@ -324,19 +384,32 @@ func (q *RedisQueue) Cancel(id string) (bool, error) {
 			p.HSet(ctx, q.tasksKey(), id, nb)
 			return nil
 		})
-		if err == nil {
-			cancelled = true
-		}
 		return err
 	}
+	committed := false
 	for i := 0; i < 3; i++ {
 		err := q.client.Watch(ctx, txf, q.tasksKey())
 		if err == redis.TxFailedErr {
 			continue
 		}
-		return cancelled, err
+		if err != nil {
+			return false, err
+		}
+		committed = true
+		break
 	}
-	return false, redis.TxFailedErr
+	if !committed {
+		return false, redis.TxFailedErr
+	}
+
+	switch status {
+	case StatusPending, StatusScheduled, StatusProcessing:
+		if err := q.client.Set(ctx, q.cancelKey(id), "1", cancelSignalTTL).Err(); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 func (q *RedisQueue) Stats() (Stats, error) {
