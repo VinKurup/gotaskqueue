@@ -286,6 +286,93 @@ func TestRedisWorkers(t *testing.T) {
 	}
 }
 
+func TestRedisReaperRedeliversStranded(t *testing.T) {
+	client := newTestRedis(t)
+	q := NewRedisQueue(client, "jobs",
+		WithRedisVisibilityTimeout(20*time.Millisecond),
+		WithRedisPollInterval(5*time.Millisecond))
+
+	done := make(chan struct{}, 1)
+	var ran int64
+	q.Register("job", func(_ context.Context, _ Task) error {
+		atomic.AddInt64(&ran, 1)
+		done <- struct{}{}
+		return nil
+	})
+
+	id, _ := q.Enqueue("job", nil)
+
+	// Simulate a worker that claimed the job then crashed: move it into the
+	// in-flight list with an already-expired deadline, and never process it.
+	ctx := context.Background()
+	if _, err := client.RPopLPush(ctx, q.readyKey(), q.inflightKey()).Result(); err != nil {
+		t.Fatalf("setup RPOPLPUSH: %v", err)
+	}
+	client.ZAdd(ctx, q.deadlineKey(), redis.Z{Score: unixScore(time.Now().Add(-time.Second)), Member: id})
+
+	q.Start(1)
+	defer q.Stop()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stranded task was never redelivered")
+	}
+	waitForRedisStatus(t, q, id, StatusCompleted, 2*time.Second)
+	if got := atomic.LoadInt64(&ran); got != 1 {
+		t.Fatalf("handler ran %d times, want 1", got)
+	}
+}
+
+func TestRedisInflightClearedAfterCompletion(t *testing.T) {
+	client := newTestRedis(t)
+	q := NewRedisQueue(client, "jobs", WithRedisPollInterval(5*time.Millisecond))
+	done := make(chan struct{}, 1)
+	q.Register("job", func(_ context.Context, _ Task) error { done <- struct{}{}; return nil })
+
+	q.Start(1)
+	defer q.Stop()
+	q.Enqueue("job", nil)
+	<-done
+
+	ctx := context.Background()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		l, _ := client.LLen(ctx, q.inflightKey()).Result()
+		z, _ := client.ZCard(ctx, q.deadlineKey()).Result()
+		if l == 0 && z == 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	l, _ := client.LLen(ctx, q.inflightKey()).Result()
+	z, _ := client.ZCard(ctx, q.deadlineKey()).Result()
+	t.Fatalf("in-flight not cleared after completion: inflight=%d deadlines=%d", l, z)
+}
+
+func TestRedisReaperPoisonCap(t *testing.T) {
+	client := newTestRedis(t)
+	q := NewRedisQueue(client, "jobs", WithRedisMaxRetries(1), WithRedisVisibilityTimeout(time.Millisecond))
+	id, _ := q.Enqueue("job", nil)
+	ctx := context.Background()
+
+	strand := func() {
+		client.RPopLPush(ctx, q.readyKey(), q.inflightKey())
+		client.ZAdd(ctx, q.deadlineKey(), redis.Z{Score: unixScore(time.Now().Add(-time.Second)), Member: id})
+	}
+
+	strand()
+	q.reap(ctx) // 1st redelivery: Retries 0->1, still <= max
+	if got, _, _ := q.GetTask(id); got.Status != StatusPending {
+		t.Fatalf("after 1st reap: status %q, want pending", got.Status)
+	}
+	strand()
+	q.reap(ctx) // 2nd: Retries 1->2 > max -> poison -> failed
+	if got, _, _ := q.GetTask(id); got.Status != StatusFailed {
+		t.Fatalf("after 2nd reap: status %q, want failed", got.Status)
+	}
+}
+
 func TestRedisStats(t *testing.T) {
 	q := NewRedisQueue(newTestRedis(t), "jobs", WithRedisMaxRetries(0))
 	q.Register("ok", func(_ context.Context, _ Task) error { return nil })

@@ -20,6 +20,8 @@ const brpopTimeout = time.Second
 
 const stopSentinel = "__stop__"
 
+const defaultVisibilityTimeout = 30 * time.Second
+
 type RedisOption func(*RedisQueue)
 
 func WithRedisMaxRetries(n int) RedisOption {
@@ -49,16 +51,21 @@ func WithRedisMaxTasks(n int) RedisOption {
 	return func(q *RedisQueue) { q.maxTasks = n }
 }
 
+func WithRedisVisibilityTimeout(d time.Duration) RedisOption {
+	return func(q *RedisQueue) { q.visibilityTimeout = d }
+}
+
 type RedisQueue struct {
-	client          *redis.Client
-	name            string
-	pollInterval    time.Duration
-	maxRetries      int
-	backoffBase     time.Duration
-	backoffMax      time.Duration
-	taskTTL         time.Duration
-	cleanupInterval time.Duration
-	maxTasks        int
+	client            *redis.Client
+	name              string
+	pollInterval      time.Duration
+	maxRetries        int
+	backoffBase       time.Duration
+	backoffMax        time.Duration
+	taskTTL           time.Duration
+	cleanupInterval   time.Duration
+	maxTasks          int
+	visibilityTimeout time.Duration
 
 	mu       sync.Mutex
 	handlers map[string]Handler
@@ -71,16 +78,17 @@ type RedisQueue struct {
 
 func NewRedisQueue(client *redis.Client, name string, opts ...RedisOption) *RedisQueue {
 	q := &RedisQueue{
-		client:          client,
-		name:            name,
-		pollInterval:    defaultRedisPoll,
-		maxRetries:      defaultMaxRetries,
-		backoffBase:     defaultBackoffBase,
-		backoffMax:      defaultBackoffMax,
-		taskTTL:         defaultTaskTTL,
-		cleanupInterval: defaultCleanupInterval,
-		handlers:        make(map[string]Handler),
-		done:            make(chan struct{}),
+		client:            client,
+		name:              name,
+		pollInterval:      defaultRedisPoll,
+		maxRetries:        defaultMaxRetries,
+		backoffBase:       defaultBackoffBase,
+		backoffMax:        defaultBackoffMax,
+		taskTTL:           defaultTaskTTL,
+		cleanupInterval:   defaultCleanupInterval,
+		visibilityTimeout: defaultVisibilityTimeout,
+		handlers:          make(map[string]Handler),
+		done:              make(chan struct{}),
 	}
 	for _, o := range opts {
 		o(q)
@@ -92,6 +100,8 @@ func (q *RedisQueue) readyKey() string           { return q.name + ":ready" }
 func (q *RedisQueue) tasksKey() string           { return q.name + ":tasks" }
 func (q *RedisQueue) delayedKey() string         { return q.name + ":delayed" }
 func (q *RedisQueue) seqKey() string             { return q.name + ":seq" }
+func (q *RedisQueue) inflightKey() string        { return q.name + ":inflight" }
+func (q *RedisQueue) deadlineKey() string        { return q.name + ":deadlines" }
 func (q *RedisQueue) cancelKey(id string) string { return q.name + ":cancel:" + id }
 
 func (q *RedisQueue) Enqueue(taskType string, data []byte) (string, error) {
@@ -190,6 +200,8 @@ func (q *RedisQueue) Start(workers int) {
 	go q.promoter()
 	q.wg.Add(1)
 	go q.cleanupLoop()
+	q.wg.Add(1)
+	go q.reaper()
 }
 
 func (q *RedisQueue) Stop() {
@@ -217,7 +229,7 @@ func (q *RedisQueue) worker() {
 	defer q.wg.Done()
 	ctx := context.Background()
 	for {
-		res, err := q.client.BRPop(ctx, brpopTimeout, q.readyKey()).Result()
+		id, err := q.client.BRPopLPush(ctx, q.readyKey(), q.inflightKey(), brpopTimeout).Result()
 		if err != nil {
 			if err == redis.Nil {
 				select {
@@ -234,15 +246,104 @@ func (q *RedisQueue) worker() {
 			}
 			continue
 		}
-		id := res[1]
 		if id == stopSentinel {
+			q.client.LRem(ctx, q.inflightKey(), 1, stopSentinel)
 			return
 		}
+
+		q.extendDeadline(ctx, id)
 		t, ok, err := q.getTask(ctx, id)
 		if err != nil || !ok || t.Status == StatusCancelled {
+			q.ackInflight(ctx, id)
 			continue
 		}
+
+		hbDone := make(chan struct{})
+		go q.heartbeat(id, hbDone)
 		q.runTask(ctx, &t)
+		close(hbDone)
+		q.ackInflight(ctx, id)
+	}
+}
+
+// ackInflight removes a finished job from the in-flight tracking so the reaper
+// won't redeliver it.
+func (q *RedisQueue) ackInflight(ctx context.Context, id string) {
+	q.client.LRem(ctx, q.inflightKey(), 1, id)
+	q.client.ZRem(ctx, q.deadlineKey(), id)
+}
+
+func (q *RedisQueue) extendDeadline(ctx context.Context, id string) {
+	q.client.ZAdd(ctx, q.deadlineKey(), redis.Z{
+		Score:  unixScore(time.Now().Add(q.visibilityTimeout)),
+		Member: id,
+	})
+}
+
+// heartbeat keeps a running job's deadline in the future so a slow-but-alive
+// worker is not mistaken for a dead one.
+func (q *RedisQueue) heartbeat(id string, done chan struct{}) {
+	interval := q.visibilityTimeout / 3
+	if interval <= 0 {
+		interval = q.pollInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	ctx := context.Background()
+	for {
+		select {
+		case <-done:
+			return
+		case <-q.done:
+			return
+		case <-ticker.C:
+			q.extendDeadline(ctx, id)
+		}
+	}
+}
+
+// reaper redelivers jobs whose worker went silent past the visibility timeout.
+func (q *RedisQueue) reaper() {
+	defer q.wg.Done()
+	ctx := context.Background()
+	for {
+		q.reap(ctx)
+		select {
+		case <-q.done:
+			return
+		case <-time.After(q.pollInterval):
+		}
+	}
+}
+
+func (q *RedisQueue) reap(ctx context.Context) {
+	now := strconv.FormatFloat(unixScore(time.Now()), 'f', -1, 64)
+	ids, err := q.client.ZRangeByScore(ctx, q.deadlineKey(), &redis.ZRangeBy{Min: "0", Max: now}).Result()
+	if err != nil {
+		return
+	}
+	for _, id := range ids {
+		claimed, err := q.client.ZRem(ctx, q.deadlineKey(), id).Result()
+		if err != nil || claimed == 0 {
+			continue // another reaper claimed it
+		}
+		q.client.LRem(ctx, q.inflightKey(), 1, id)
+
+		t, ok, err := q.getTask(ctx, id)
+		if err != nil || !ok || isTerminal(t.Status) {
+			continue // finished; ack was just lost, nothing to redeliver
+		}
+
+		t.Retries++
+		if t.Retries > t.MaxRetries {
+			t.Status = StatusFailed
+			t.FinishedAt = time.Now()
+			q.save(ctx, &t)
+			continue
+		}
+		t.Status = StatusPending
+		q.save(ctx, &t)
+		q.client.LPush(ctx, q.readyKey(), id)
 	}
 }
 
