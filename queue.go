@@ -3,6 +3,7 @@ package gotaskqueue
 import (
 	"context"
 	"errors"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -83,6 +84,10 @@ func WithCleanupInterval(d time.Duration) Option {
 	return func(q *MemoryQueue) { q.cleanupInterval = d }
 }
 
+func WithMaxTasks(n int) Option {
+	return func(q *MemoryQueue) { q.maxTasks = n }
+}
+
 type MemoryQueue struct {
 	name            string
 	mu              sync.Mutex
@@ -102,6 +107,7 @@ type MemoryQueue struct {
 	backoffMax      time.Duration
 	taskTTL         time.Duration
 	cleanupInterval time.Duration
+	maxTasks        int
 	done            chan struct{}
 	started         bool
 	stopped         bool
@@ -434,7 +440,32 @@ func (q *MemoryQueue) Cancel(id string) (bool, error) {
 func (q *MemoryQueue) Cleanup() (int, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return q.purgeExpired(time.Now()), nil
+	return q.purgeExpired(time.Now()) + q.purgeOverflow(), nil
+}
+
+func (q *MemoryQueue) purgeOverflow() int {
+	if q.maxTasks <= 0 || len(q.tasks) <= q.maxTasks {
+		return 0
+	}
+	terminal := make([]*Task, 0, len(q.tasks))
+	for _, t := range q.tasks {
+		if isTerminal(t.Status) {
+			terminal = append(terminal, t)
+		}
+	}
+	sort.Slice(terminal, func(i, j int) bool {
+		return terminal[i].FinishedAt.Before(terminal[j].FinishedAt)
+	})
+	excess := len(q.tasks) - q.maxTasks
+	n := 0
+	for _, t := range terminal {
+		if n >= excess {
+			break
+		}
+		delete(q.tasks, t.ID)
+		n++
+	}
+	return n
 }
 
 func (q *MemoryQueue) purgeExpired(now time.Time) int {

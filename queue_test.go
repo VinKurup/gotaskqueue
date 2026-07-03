@@ -665,6 +665,55 @@ func TestCleanupLoopEvicts(t *testing.T) {
 	t.Fatal("background cleanup never evicted the completed task")
 }
 
+func TestMaxTasksEvictsOldestTerminal(t *testing.T) {
+	q := NewMemoryQueue("jobs", WithMaxTasks(2), WithTaskTTL(time.Hour))
+	q.Register("ok", func(_ context.Context, _ Task) error { return nil })
+
+	ids := make([]string, 5)
+	for i := 0; i < 5; i++ {
+		ids[i], _ = q.Enqueue("ok", nil)
+		q.ProcessNext()
+		time.Sleep(time.Millisecond) // distinct FinishedAt for deterministic ordering
+	}
+
+	n, _ := q.Cleanup()
+	if n != 3 {
+		t.Fatalf("evicted %d, want 3", n)
+	}
+	// oldest three gone, newest two kept
+	for _, id := range ids[:3] {
+		if _, ok, _ := q.GetTask(id); ok {
+			t.Fatalf("old task %s should have been evicted", id)
+		}
+	}
+	for _, id := range ids[3:] {
+		if _, ok, _ := q.GetTask(id); !ok {
+			t.Fatalf("recent task %s should have been kept", id)
+		}
+	}
+}
+
+func TestMaxTasksKeepsLive(t *testing.T) {
+	q := NewMemoryQueue("jobs", WithMaxTasks(1), WithTaskTTL(time.Hour))
+	q.Register("ok", func(_ context.Context, _ Task) error { return nil })
+
+	done, _ := q.Enqueue("ok", nil)
+	q.ProcessNext() // completed
+	p1, _ := q.Enqueue("ok", nil)
+	p2, _ := q.Enqueue("ok", nil) // both pending
+
+	q.Cleanup() // over cap (3 > 1), but only the 1 terminal is evictable
+
+	if _, ok, _ := q.GetTask(done); ok {
+		t.Fatal("completed task should have been evicted")
+	}
+	for _, id := range []string{p1, p2} {
+		if _, ok, _ := q.GetTask(id); !ok {
+			t.Fatalf("pending task %s must not be evicted", id)
+		}
+	}
+}
+
 // itoa is a tiny helper so tests don't depend on strconv for labels.
 func itoa(n int) string {
 	if n == 0 {
