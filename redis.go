@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -44,6 +45,10 @@ func WithRedisCleanupInterval(d time.Duration) RedisOption {
 	return func(q *RedisQueue) { q.cleanupInterval = d }
 }
 
+func WithRedisMaxTasks(n int) RedisOption {
+	return func(q *RedisQueue) { q.maxTasks = n }
+}
+
 type RedisQueue struct {
 	client          *redis.Client
 	name            string
@@ -53,6 +58,7 @@ type RedisQueue struct {
 	backoffMax      time.Duration
 	taskTTL         time.Duration
 	cleanupInterval time.Duration
+	maxTasks        int
 
 	mu       sync.Mutex
 	handlers map[string]Handler
@@ -450,6 +456,13 @@ func (q *RedisQueue) Cleanup() (int, error) {
 	}
 	now := time.Now()
 	n := 0
+
+	remaining := 0
+	type finished struct {
+		id string
+		at time.Time
+	}
+	var terminal []finished
 	for id, v := range m {
 		var t Task
 		if err := json.Unmarshal([]byte(v), &t); err != nil {
@@ -458,6 +471,27 @@ func (q *RedisQueue) Cleanup() (int, error) {
 		if isTerminal(t.Status) && now.Sub(t.FinishedAt) > q.taskTTL {
 			if q.client.HDel(ctx, q.tasksKey(), id).Err() == nil {
 				n++
+			}
+			continue
+		}
+		remaining++
+		if isTerminal(t.Status) {
+			terminal = append(terminal, finished{id, t.FinishedAt})
+		}
+	}
+
+	if q.maxTasks > 0 && remaining > q.maxTasks {
+		sort.Slice(terminal, func(i, j int) bool {
+			return terminal[i].at.Before(terminal[j].at)
+		})
+		excess := remaining - q.maxTasks
+		for _, f := range terminal {
+			if excess <= 0 {
+				break
+			}
+			if q.client.HDel(ctx, q.tasksKey(), f.id).Err() == nil {
+				n++
+				excess--
 			}
 		}
 	}

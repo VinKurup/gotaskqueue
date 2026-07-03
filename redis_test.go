@@ -438,6 +438,57 @@ func TestRedisWorkerSkipsCancelled(t *testing.T) {
 	}
 }
 
+func TestRedisMaxTasksEvictsOldestTerminal(t *testing.T) {
+	q := NewRedisQueue(newTestRedis(t), "jobs", WithRedisMaxTasks(2), WithRedisTaskTTL(time.Hour))
+	q.Register("ok", func(_ context.Context, _ Task) error { return nil })
+
+	ids := make([]string, 5)
+	for i := 0; i < 5; i++ {
+		ids[i], _ = q.Enqueue("ok", nil)
+		q.ProcessNext()
+		time.Sleep(time.Millisecond) // distinct FinishedAt for deterministic ordering
+	}
+
+	n, err := q.Cleanup()
+	if err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("evicted %d, want 3", n)
+	}
+	for _, id := range ids[:3] {
+		if _, ok, _ := q.GetTask(id); ok {
+			t.Fatalf("old task %s should have been evicted", id)
+		}
+	}
+	for _, id := range ids[3:] {
+		if _, ok, _ := q.GetTask(id); !ok {
+			t.Fatalf("recent task %s should have been kept", id)
+		}
+	}
+}
+
+func TestRedisMaxTasksKeepsLive(t *testing.T) {
+	q := NewRedisQueue(newTestRedis(t), "jobs", WithRedisMaxTasks(1), WithRedisTaskTTL(time.Hour))
+	q.Register("ok", func(_ context.Context, _ Task) error { return nil })
+
+	done, _ := q.Enqueue("ok", nil)
+	q.ProcessNext()
+	p1, _ := q.Enqueue("ok", nil)
+	p2, _ := q.Enqueue("ok", nil)
+
+	q.Cleanup()
+
+	if _, ok, _ := q.GetTask(done); ok {
+		t.Fatal("completed task should have been evicted")
+	}
+	for _, id := range []string{p1, p2} {
+		if _, ok, _ := q.GetTask(id); !ok {
+			t.Fatalf("pending task %s must not be evicted", id)
+		}
+	}
+}
+
 func TestRedisCleanup(t *testing.T) {
 	q := NewRedisQueue(newTestRedis(t), "jobs", WithRedisTaskTTL(time.Millisecond))
 	q.Register("ok", func(_ context.Context, _ Task) error { return nil })
