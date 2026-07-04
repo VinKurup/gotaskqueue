@@ -723,6 +723,60 @@ func TestRedisWorkerSkipsCancelled(t *testing.T) {
 	}
 }
 
+func TestRedisDeadLetterAndReplay(t *testing.T) {
+	q := NewRedisQueue(newTestRedis(t), "jobs", WithRedisMaxRetries(0))
+	var calls int64
+	q.Register("job", func(_ context.Context, _ Task) error {
+		if atomic.AddInt64(&calls, 1) == 1 {
+			return errors.New("boom")
+		}
+		return nil
+	})
+
+	id, _ := q.Enqueue("job", nil)
+	q.ProcessNext() // fails -> dead letter
+	if got, _, _ := q.GetTask(id); got.Status != StatusFailed {
+		t.Fatalf("status %q, want failed", got.Status)
+	}
+	dl, _ := q.DeadLetters()
+	if len(dl) != 1 || dl[0].ID != id {
+		t.Fatalf("dead letters: %+v", dl)
+	}
+
+	ok, err := q.Replay(id)
+	if err != nil || !ok {
+		t.Fatalf("Replay: ok=%v err=%v", ok, err)
+	}
+	if got, _, _ := q.GetTask(id); got.Status != StatusPending || got.Retries != 0 {
+		t.Fatalf("after replay: %+v", got)
+	}
+
+	processed, _ := q.ProcessNext()
+	if !processed {
+		t.Fatal("replayed task was not processed")
+	}
+	if got, _, _ := q.GetTask(id); got.Status != StatusCompleted {
+		t.Fatalf("replayed task status %q, want completed", got.Status)
+	}
+	if dl2, _ := q.DeadLetters(); len(dl2) != 0 {
+		t.Fatalf("still dead-lettered after successful replay: %+v", dl2)
+	}
+}
+
+func TestRedisDeadLetterExemptFromCleanup(t *testing.T) {
+	q := NewRedisQueue(newTestRedis(t), "jobs", WithRedisMaxRetries(0), WithRedisTaskTTL(time.Millisecond))
+	q.Register("bad", func(_ context.Context, _ Task) error { return errors.New("boom") })
+
+	id, _ := q.Enqueue("bad", nil)
+	q.ProcessNext() // -> failed (dead letter)
+	time.Sleep(5 * time.Millisecond)
+	q.Cleanup()
+
+	if _, ok, _ := q.GetTask(id); !ok {
+		t.Fatal("dead letter must not be purged by TTL cleanup")
+	}
+}
+
 func TestRedisMaxTasksEvictsOldestTerminal(t *testing.T) {
 	q := NewRedisQueue(newTestRedis(t), "jobs", WithRedisMaxTasks(2), WithRedisTaskTTL(time.Hour))
 	q.Register("ok", func(_ context.Context, _ Task) error { return nil })

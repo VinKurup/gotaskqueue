@@ -57,6 +57,8 @@ type Queue interface {
 	Cancel(id string) (bool, error)
 	Stats() (Stats, error)
 	Cleanup() (int, error)
+	DeadLetters() ([]Task, error)
+	Replay(id string) (bool, error)
 }
 
 var (
@@ -236,9 +238,6 @@ func (q *MemoryQueue) Stop() {
 	waitWithTimeout(&q.wg, q.shutdownTimeout)
 }
 
-// waitWithTimeout waits for the WaitGroup, giving up after timeout (0 = wait
-// forever). On timeout the outstanding goroutines are left running — the caller
-// has decided a stuck handler shouldn't hold up shutdown.
 func waitWithTimeout(wg *sync.WaitGroup, timeout time.Duration) {
 	if timeout <= 0 {
 		wg.Wait()
@@ -479,13 +478,44 @@ func (q *MemoryQueue) Cleanup() (int, error) {
 	return q.purgeExpired(time.Now()) + q.purgeOverflow(), nil
 }
 
+func (q *MemoryQueue) DeadLetters() ([]Task, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	var out []Task
+	for _, t := range q.tasks {
+		if t.Status == StatusFailed {
+			out = append(out, *t)
+		}
+	}
+	return out, nil
+}
+
+func (q *MemoryQueue) Replay(id string) (bool, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.stopped {
+		return false, ErrQueueStopped
+	}
+	t, ok := q.tasks[id]
+	if !ok || t.Status != StatusFailed {
+		return false, nil
+	}
+	t.Status = StatusPending
+	t.Retries = 0
+	t.Deliveries = 0
+	t.FinishedAt = time.Time{}
+	q.push(t)
+	q.cond.Signal()
+	return true, nil
+}
+
 func (q *MemoryQueue) purgeOverflow() int {
 	if q.maxTasks <= 0 || len(q.tasks) <= q.maxTasks {
 		return 0
 	}
 	terminal := make([]*Task, 0, len(q.tasks))
 	for _, t := range q.tasks {
-		if isTerminal(t.Status) {
+		if isPurgeable(t.Status) {
 			terminal = append(terminal, t)
 		}
 	}
@@ -507,7 +537,7 @@ func (q *MemoryQueue) purgeOverflow() int {
 func (q *MemoryQueue) purgeExpired(now time.Time) int {
 	n := 0
 	for id, t := range q.tasks {
-		if isTerminal(t.Status) && now.Sub(t.FinishedAt) > q.taskTTL {
+		if isPurgeable(t.Status) && now.Sub(t.FinishedAt) > q.taskTTL {
 			delete(q.tasks, id)
 			n++
 		}
@@ -517,6 +547,12 @@ func (q *MemoryQueue) purgeExpired(now time.Time) int {
 
 func isTerminal(s TaskStatus) bool {
 	return s == StatusCompleted || s == StatusFailed || s == StatusCancelled
+}
+
+// isPurgeable is like isTerminal but excludes StatusFailed: failed tasks are the
+// dead-letter queue, kept until replayed or discarded rather than auto-cleaned.
+func isPurgeable(s TaskStatus) bool {
+	return s == StatusCompleted || s == StatusCancelled
 }
 
 type Stats struct {

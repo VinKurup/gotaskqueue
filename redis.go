@@ -622,6 +622,52 @@ func (q *RedisQueue) Stats() (Stats, error) {
 	return s, nil
 }
 
+func (q *RedisQueue) DeadLetters() ([]Task, error) {
+	m, err := q.client.HGetAll(context.Background(), q.tasksKey()).Result()
+	if err != nil {
+		return nil, err
+	}
+	var out []Task
+	for _, v := range m {
+		var t Task
+		if err := json.Unmarshal([]byte(v), &t); err != nil {
+			continue
+		}
+		if t.Status == StatusFailed {
+			out = append(out, t)
+		}
+	}
+	return out, nil
+}
+
+func (q *RedisQueue) Replay(id string) (bool, error) {
+	ctx := context.Background()
+	t, ok, err := q.getTask(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	if !ok || t.Status != StatusFailed {
+		return false, nil
+	}
+	t.Status = StatusPending
+	t.Retries = 0
+	t.Deliveries = 0
+	t.FinishedAt = time.Time{}
+	b, err := json.Marshal(&t)
+	if err != nil {
+		return false, err
+	}
+	_, err = q.client.TxPipelined(ctx, func(p redis.Pipeliner) error {
+		p.HSet(ctx, q.tasksKey(), id, b)
+		p.LPush(ctx, q.readyKey(), id)
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (q *RedisQueue) Cleanup() (int, error) {
 	ctx := context.Background()
 	m, err := q.client.HGetAll(ctx, q.tasksKey()).Result()
@@ -642,14 +688,14 @@ func (q *RedisQueue) Cleanup() (int, error) {
 		if err := json.Unmarshal([]byte(v), &t); err != nil {
 			continue
 		}
-		if isTerminal(t.Status) && now.Sub(t.FinishedAt) > q.taskTTL {
+		if isPurgeable(t.Status) && now.Sub(t.FinishedAt) > q.taskTTL {
 			if q.client.HDel(ctx, q.tasksKey(), id).Err() == nil {
 				n++
 			}
 			continue
 		}
 		remaining++
-		if isTerminal(t.Status) {
+		if isPurgeable(t.Status) {
 			terminal = append(terminal, finished{id, t.FinishedAt})
 		}
 	}
