@@ -723,6 +723,19 @@ func TestRedisWorkerSkipsCancelled(t *testing.T) {
 	}
 }
 
+func TestRedisLoggerCapturesHandlerFailure(t *testing.T) {
+	lg := &captureLogger{}
+	q := NewRedisQueue(newTestRedis(t), "jobs", WithRedisMaxRetries(0), WithRedisLogger(lg))
+	q.Register("bad", func(_ context.Context, _ Task) error { return errors.New("boom") })
+
+	q.Enqueue("bad", nil)
+	q.ProcessNext()
+
+	if !lg.has("task handler failed") {
+		t.Fatalf("handler failure was not logged; got %v", lg.msgs)
+	}
+}
+
 func TestRedisDeadLetterAndReplay(t *testing.T) {
 	q := NewRedisQueue(newTestRedis(t), "jobs", WithRedisMaxRetries(0))
 	var calls int64

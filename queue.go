@@ -3,6 +3,7 @@ package gotaskqueue
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sort"
 	"strconv"
 	"sync"
@@ -45,6 +46,15 @@ type Task struct {
 }
 
 type Handler func(context.Context, Task) error
+
+// Logger surfaces errors the queue would otherwise swallow (background-loop
+// failures, handler errors). The signature matches *slog.Logger.Error, so a
+// *slog.Logger can be passed directly. Default is no logger (silent).
+type Logger interface {
+	Error(msg string, args ...any)
+}
+
+var _ Logger = (*slog.Logger)(nil)
 
 type Queue interface {
 	Enqueue(taskType string, data []byte) (string, error)
@@ -99,6 +109,10 @@ func WithShutdownTimeout(d time.Duration) Option {
 	return func(q *MemoryQueue) { q.shutdownTimeout = d }
 }
 
+func WithLogger(l Logger) Option {
+	return func(q *MemoryQueue) { q.logger = l }
+}
+
 type MemoryQueue struct {
 	name            string
 	mu              sync.Mutex
@@ -121,6 +135,7 @@ type MemoryQueue struct {
 	maxTasks        int
 	handlerTimeout  time.Duration
 	shutdownTimeout time.Duration
+	logger          Logger
 	done            chan struct{}
 	started         bool
 	stopped         bool
@@ -369,6 +384,7 @@ func (q *MemoryQueue) runTask(t *Task) error {
 	if !ok {
 		q.mu.Unlock()
 		q.setStatus(t, StatusFailed)
+		q.logError("no handler registered", "id", t.ID, "type", t.Type)
 		return errors.New("no handler registered for task type " + t.Type)
 	}
 	baseCtx, cancel := context.WithCancel(context.Background())
@@ -399,11 +415,18 @@ func (q *MemoryQueue) runTask(t *Task) error {
 	q.mu.Unlock()
 
 	if err != nil {
+		q.logError("task handler failed", "id", t.ID, "type", t.Type, "err", err)
 		q.retryOrFail(t)
 		return err
 	}
 	q.setStatus(t, StatusCompleted)
 	return nil
+}
+
+func (q *MemoryQueue) logError(msg string, args ...any) {
+	if q.logger != nil {
+		q.logger.Error(msg, args...)
+	}
 }
 
 func (q *MemoryQueue) retryOrFail(t *Task) {

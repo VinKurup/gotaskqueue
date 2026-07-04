@@ -76,6 +76,10 @@ func WithRedisShutdownTimeout(d time.Duration) RedisOption {
 	return func(q *RedisQueue) { q.shutdownTimeout = d }
 }
 
+func WithRedisLogger(l Logger) RedisOption {
+	return func(q *RedisQueue) { q.logger = l }
+}
+
 type RedisQueue struct {
 	client            *redis.Client
 	name              string
@@ -90,6 +94,7 @@ type RedisQueue struct {
 	maxDeliveries     int
 	handlerTimeout    time.Duration
 	shutdownTimeout   time.Duration
+	logger            Logger
 
 	mu       sync.Mutex
 	handlers map[string]Handler
@@ -278,6 +283,7 @@ func (q *RedisQueue) worker() {
 					continue
 				}
 			}
+			q.logError("worker: claim failed", "err", err)
 			select {
 			case <-q.done:
 				return
@@ -344,6 +350,7 @@ func (q *RedisQueue) heartbeat(id string, done chan struct{}) {
 func (q *RedisQueue) reconcileInflight(ctx context.Context) {
 	ids, err := q.client.LRange(ctx, q.inflightKey(), 0, -1).Result()
 	if err != nil {
+		q.logError("reaper: list inflight failed", "err", err)
 		return
 	}
 	for _, id := range ids {
@@ -375,6 +382,7 @@ func (q *RedisQueue) reap(ctx context.Context) {
 	now := strconv.FormatFloat(unixScore(time.Now()), 'f', -1, 64)
 	ids, err := q.client.ZRangeByScore(ctx, q.deadlineKey(), &redis.ZRangeBy{Min: "0", Max: now}).Result()
 	if err != nil {
+		q.logError("reaper: scan deadlines failed", "err", err)
 		return
 	}
 	for _, id := range ids {
@@ -419,6 +427,7 @@ func (q *RedisQueue) promoteDue(ctx context.Context) {
 	now := strconv.FormatFloat(unixScore(time.Now()), 'f', -1, 64)
 	ids, err := q.client.ZRangeByScore(ctx, q.delayedKey(), &redis.ZRangeBy{Min: "0", Max: now}).Result()
 	if err != nil {
+		q.logError("promoter: scan delayed failed", "err", err)
 		return
 	}
 	for _, id := range ids {
@@ -448,6 +457,7 @@ func (q *RedisQueue) runTask(ctx context.Context, t *Task) error {
 		t.Status = StatusFailed
 		t.FinishedAt = time.Now()
 		_ = q.save(ctx, t)
+		q.logError("no handler registered", "id", t.ID, "type", t.Type)
 		return errors.New("no handler registered for task type " + t.Type)
 	}
 
@@ -483,11 +493,18 @@ func (q *RedisQueue) runTask(ctx context.Context, t *Task) error {
 		return herr
 	}
 	if herr != nil {
+		q.logError("task handler failed", "id", t.ID, "type", t.Type, "err", herr)
 		return q.retryOrFail(ctx, t, herr)
 	}
 	t.Status = StatusCompleted
 	t.FinishedAt = time.Now()
 	return q.save(ctx, t)
+}
+
+func (q *RedisQueue) logError(msg string, args ...any) {
+	if q.logger != nil {
+		q.logger.Error(msg, args...)
+	}
 }
 
 func (q *RedisQueue) watchCancel(id string, cancel context.CancelFunc, done chan struct{}) {
@@ -725,7 +742,9 @@ func (q *RedisQueue) cleanupLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			q.Cleanup()
+			if _, err := q.Cleanup(); err != nil {
+				q.logError("cleanup failed", "err", err)
+			}
 		case <-q.done:
 			return
 		}

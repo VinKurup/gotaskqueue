@@ -719,6 +719,41 @@ func TestCleanupLoopEvicts(t *testing.T) {
 	t.Fatal("background cleanup never evicted the completed task")
 }
 
+type captureLogger struct {
+	mu   sync.Mutex
+	msgs []string
+}
+
+func (c *captureLogger) Error(msg string, args ...any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.msgs = append(c.msgs, msg)
+}
+
+func (c *captureLogger) has(msg string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, m := range c.msgs {
+		if m == msg {
+			return true
+		}
+	}
+	return false
+}
+
+func TestLoggerCapturesHandlerFailure(t *testing.T) {
+	lg := &captureLogger{}
+	q := NewMemoryQueue("jobs", WithMaxRetries(0), WithLogger(lg))
+	q.Register("bad", func(_ context.Context, _ Task) error { return errors.New("boom") })
+
+	q.Enqueue("bad", nil)
+	q.ProcessNext()
+
+	if !lg.has("task handler failed") {
+		t.Fatalf("handler failure was not logged; got %v", lg.msgs)
+	}
+}
+
 func TestDeadLetterAndReplay(t *testing.T) {
 	q := NewMemoryQueue("jobs", WithMaxRetries(0))
 	var calls int64
