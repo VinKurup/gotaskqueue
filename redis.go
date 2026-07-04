@@ -318,7 +318,21 @@ func (q *RedisQueue) heartbeat(id string, done chan struct{}) {
 	}
 }
 
-// reaper redelivers jobs whose worker went silent past the visibility timeout.
+func (q *RedisQueue) reconcileInflight(ctx context.Context) {
+	ids, err := q.client.LRange(ctx, q.inflightKey(), 0, -1).Result()
+	if err != nil {
+		return
+	}
+	for _, id := range ids {
+		if id == stopSentinel {
+			continue
+		}
+		if _, err := q.client.ZScore(ctx, q.deadlineKey(), id).Result(); err == redis.Nil {
+			q.extendDeadline(ctx, id)
+		}
+	}
+}
+
 func (q *RedisQueue) reaper() {
 	defer q.wg.Done()
 	ctx := context.Background()
@@ -333,6 +347,8 @@ func (q *RedisQueue) reaper() {
 }
 
 func (q *RedisQueue) reap(ctx context.Context) {
+	q.reconcileInflight(ctx)
+
 	now := strconv.FormatFloat(unixScore(time.Now()), 'f', -1, 64)
 	ids, err := q.client.ZRangeByScore(ctx, q.deadlineKey(), &redis.ZRangeBy{Min: "0", Max: now}).Result()
 	if err != nil {

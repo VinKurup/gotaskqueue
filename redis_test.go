@@ -363,6 +363,38 @@ func TestRedisReaperRedeliversStranded(t *testing.T) {
 	}
 }
 
+func TestRedisReaperRecoversOrphanWithoutDeadline(t *testing.T) {
+	client := newTestRedis(t)
+	q := NewRedisQueue(client, "jobs", WithRedisVisibilityTimeout(time.Millisecond))
+	ctx := context.Background()
+
+	id, _ := q.Enqueue("job", nil)
+
+	// Simulate a worker that claimed the job (atomic move to inflight) then died
+	// before setting a deadline — the gap the reconciliation must cover.
+	client.RPopLPush(ctx, q.readyKey(), q.inflightKey())
+	if _, err := client.ZScore(ctx, q.deadlineKey(), id).Result(); err != redis.Nil {
+		t.Fatalf("precondition: expected no deadline for orphan")
+	}
+
+	q.reap(ctx) // reconcile: assigns a deadline so the orphan is visible
+	if _, err := client.ZScore(ctx, q.deadlineKey(), id).Result(); err != nil {
+		t.Fatalf("reconcile should have assigned a deadline: %v", err)
+	}
+
+	time.Sleep(3 * time.Millisecond)
+	q.reap(ctx) // deadline now expired: redeliver
+
+	ready, _ := client.LRange(ctx, q.readyKey(), 0, -1).Result()
+	if !contains(ready, id) {
+		t.Fatalf("orphan was not redelivered to ready: %v", ready)
+	}
+	infl, _ := client.LRange(ctx, q.inflightKey(), 0, -1).Result()
+	if contains(infl, id) {
+		t.Fatalf("orphan still in inflight after redelivery: %v", infl)
+	}
+}
+
 func TestRedisInflightClearedAfterCompletion(t *testing.T) {
 	client := newTestRedis(t)
 	q := NewRedisQueue(client, "jobs", WithRedisPollInterval(5*time.Millisecond))
