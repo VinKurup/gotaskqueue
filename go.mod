@@ -1,4 +1,4 @@
-module gotaskqueue
+module github.com/VinKurup/gotaskqueue
 
 go 1.26.4
 
