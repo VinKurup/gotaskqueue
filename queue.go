@@ -22,6 +22,10 @@ const (
 
 var ErrQueueStopped = errors.New("queue stopped")
 
+// currentSchemaVersion is stamped on every task. Bump it when the Task struct
+// changes in a way that affects stored (Redis) JSON, and migrate on read.
+const currentSchemaVersion = 1
+
 type TaskStatus string
 
 const (
@@ -34,15 +38,16 @@ const (
 )
 
 type Task struct {
-	ID         string
-	Type       string
-	Data       []byte
-	Status     TaskStatus
-	CreatedAt  time.Time
-	FinishedAt time.Time
-	Retries    int // handler-error retries
-	MaxRetries int
-	Deliveries int // crash redeliveries (Redis reaper); separate from Retries
+	SchemaVersion int // format of this record; see currentSchemaVersion
+	ID            string
+	Type          string
+	Data          []byte
+	Status        TaskStatus
+	CreatedAt     time.Time
+	FinishedAt    time.Time
+	Retries       int // handler-error retries
+	MaxRetries    int
+	Deliveries    int // crash redeliveries (Redis reaper); separate from Retries
 }
 
 type Handler func(context.Context, Task) error
@@ -200,12 +205,13 @@ func (q *MemoryQueue) EnqueueDelayed(taskType string, data []byte, delay time.Du
 func (q *MemoryQueue) buildTask(taskType string, data []byte, status TaskStatus) *Task {
 	q.idSeq++
 	t := &Task{
-		ID:         strconv.FormatInt(q.idSeq, 10),
-		Type:       taskType,
-		Data:       data,
-		Status:     status,
-		CreatedAt:  time.Now(),
-		MaxRetries: q.maxRetries,
+		SchemaVersion: currentSchemaVersion,
+		ID:            strconv.FormatInt(q.idSeq, 10),
+		Type:          taskType,
+		Data:          data,
+		Status:        status,
+		CreatedAt:     time.Now(),
+		MaxRetries:    q.maxRetries,
 	}
 	q.tasks[t.ID] = t
 	return t

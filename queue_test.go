@@ -133,6 +133,15 @@ func TestConcurrentEnqueue(t *testing.T) {
 
 // --- Status + worker loop ---
 
+func TestTaskSchemaVersionStamped(t *testing.T) {
+	q := NewMemoryQueue("jobs")
+	id, _ := q.Enqueue("job", nil)
+	got, _, _ := q.GetTask(id)
+	if got.SchemaVersion != currentSchemaVersion {
+		t.Fatalf("SchemaVersion = %d, want %d", got.SchemaVersion, currentSchemaVersion)
+	}
+}
+
 func TestEnqueueStartsPending(t *testing.T) {
 	q := NewMemoryQueue("jobs")
 	id, _ := q.Enqueue("send_email", nil)

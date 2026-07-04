@@ -179,12 +179,13 @@ func (q *RedisQueue) newTask(ctx context.Context, taskType string, data []byte, 
 		return nil, nil, err
 	}
 	t := &Task{
-		ID:         strconv.FormatInt(n, 10),
-		Type:       taskType,
-		Data:       data,
-		Status:     status,
-		CreatedAt:  time.Now(),
-		MaxRetries: q.maxRetries,
+		SchemaVersion: currentSchemaVersion,
+		ID:            strconv.FormatInt(n, 10),
+		Type:          taskType,
+		Data:          data,
+		Status:        status,
+		CreatedAt:     time.Now(),
+		MaxRetries:    q.maxRetries,
 	}
 	b, err := json.Marshal(t)
 	if err != nil {

@@ -45,6 +45,15 @@ func TestRedisEnqueueGetTask(t *testing.T) {
 	}
 }
 
+func TestRedisTaskSchemaVersionStamped(t *testing.T) {
+	q := NewRedisQueue(newTestRedis(t), "jobs")
+	id, _ := q.Enqueue("job", nil)
+	got, _, _ := q.GetTask(id) // round-trips through JSON in Redis
+	if got.SchemaVersion != currentSchemaVersion {
+		t.Fatalf("SchemaVersion = %d, want %d", got.SchemaVersion, currentSchemaVersion)
+	}
+}
+
 func TestRedisEnqueueRegistersAndQueuesTogether(t *testing.T) {
 	client := newTestRedis(t)
 	q := NewRedisQueue(client, "jobs")
