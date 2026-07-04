@@ -421,7 +421,7 @@ func TestRedisReaperRedeliversStranded(t *testing.T) {
 
 func TestRedisReaperRecoversOrphanWithoutDeadline(t *testing.T) {
 	client := newTestRedis(t)
-	q := NewRedisQueue(client, "jobs", WithRedisVisibilityTimeout(time.Millisecond))
+	q := NewRedisQueue(client, "jobs", WithRedisVisibilityTimeout(time.Hour))
 	ctx := context.Background()
 
 	id, _ := q.Enqueue("job", nil)
@@ -433,13 +433,16 @@ func TestRedisReaperRecoversOrphanWithoutDeadline(t *testing.T) {
 		t.Fatalf("precondition: expected no deadline for orphan")
 	}
 
-	q.reap(ctx) // reconcile: assigns a deadline so the orphan is visible
+	// Reconcile assigns a deadline far in the future, so this same reap can't also
+	// expire it — the orphan is now visible to the reaper.
+	q.reap(ctx)
 	if _, err := client.ZScore(ctx, q.deadlineKey(), id).Result(); err != nil {
 		t.Fatalf("reconcile should have assigned a deadline: %v", err)
 	}
 
-	time.Sleep(3 * time.Millisecond)
-	q.reap(ctx) // deadline now expired: redeliver
+	// Force the deadline into the past; the next reap redelivers.
+	client.ZAdd(ctx, q.deadlineKey(), redis.Z{Score: unixScore(time.Now().Add(-time.Second)), Member: id})
+	q.reap(ctx)
 
 	ready, _ := client.LRange(ctx, q.readyKey(), 0, -1).Result()
 	if !contains(ready, id) {
@@ -782,6 +785,28 @@ func TestRedisDeadLetterAndReplay(t *testing.T) {
 	}
 	if dl2, _ := q.DeadLetters(); len(dl2) != 0 {
 		t.Fatalf("still dead-lettered after successful replay: %+v", dl2)
+	}
+}
+
+func TestRedisDiscardDeadLetter(t *testing.T) {
+	q := NewRedisQueue(newTestRedis(t), "jobs", WithRedisMaxRetries(0))
+	q.Register("bad", func(_ context.Context, _ Task) error { return errors.New("boom") })
+
+	id, _ := q.Enqueue("bad", nil)
+	q.ProcessNext() // -> dead letter
+
+	ok, err := q.Discard(id)
+	if err != nil || !ok {
+		t.Fatalf("Discard: ok=%v err=%v", ok, err)
+	}
+	if _, found, _ := q.GetTask(id); found {
+		t.Fatal("discarded task is still present")
+	}
+	if dl, _ := q.DeadLetters(); len(dl) != 0 {
+		t.Fatalf("still dead-lettered after discard: %+v", dl)
+	}
+	if ok, _ := q.Discard("nope"); ok {
+		t.Fatal("Discard of an unknown id returned true")
 	}
 }
 

@@ -1,10 +1,12 @@
 # gotaskqueue
 
+[![CI](https://github.com/VinKurup/gotaskqueue/actions/workflows/ci.yml/badge.svg)](https://github.com/VinKurup/gotaskqueue/actions/workflows/ci.yml)
+
 A task/job queue for Go with two interchangeable backends behind one interface:
 
-- **`MemoryQueue`** — in-process, zero dependencies. Fast, ephemeral. Good for a
+- **`MemoryQueue`**: in-process, zero dependencies. Fast, ephemeral. Good for a
   single process, tests, and small tools.
-- **`RedisQueue`** — backed by Redis. Shared across processes/machines, survives
+- **`RedisQueue`**: backed by Redis. Shared across processes/machines, survives
   restarts, **at-least-once** delivery with crash recovery.
 
 Both satisfy the same `Queue` interface, so you can develop against the memory
@@ -102,7 +104,8 @@ type Queue interface {
 	Stats() (Stats, error)
 	Cleanup() (int, error)
 	DeadLetters() ([]Task, error)
-	Replay(id string) (bool, error)
+	Replay(id string) (bool, error)  // requeue a failed task
+	Discard(id string) (bool, error) // drop a failed task
 }
 
 type Handler func(ctx context.Context, t Task) error
@@ -139,7 +142,8 @@ any queued/running ─► cancelled  (via Cancel)
 ```
 
 `failed` is the dead-letter state: such tasks are exempt from cleanup and can be
-inspected via `DeadLetters()` and requeued via `Replay(id)`.
+inspected via `DeadLetters()`, requeued via `Replay(id)`, or dropped via
+`Discard(id)`.
 
 ## Configuration
 

@@ -803,6 +803,28 @@ func TestDeadLetterAndReplay(t *testing.T) {
 	}
 }
 
+func TestDiscardDeadLetter(t *testing.T) {
+	q := NewMemoryQueue("jobs", WithMaxRetries(0))
+	q.Register("bad", func(_ context.Context, _ Task) error { return errors.New("boom") })
+
+	id, _ := q.Enqueue("bad", nil)
+	q.ProcessNext() // -> dead letter
+
+	ok, err := q.Discard(id)
+	if err != nil || !ok {
+		t.Fatalf("Discard: ok=%v err=%v", ok, err)
+	}
+	if _, found, _ := q.GetTask(id); found {
+		t.Fatal("discarded task is still present")
+	}
+	if dl, _ := q.DeadLetters(); len(dl) != 0 {
+		t.Fatalf("still dead-lettered after discard: %+v", dl)
+	}
+	if ok, _ := q.Discard("nope"); ok {
+		t.Fatal("Discard of an unknown id returned true")
+	}
+}
+
 func TestDeadLetterExemptFromCleanup(t *testing.T) {
 	q := NewMemoryQueue("jobs", WithMaxRetries(0), WithTaskTTL(time.Millisecond))
 	q.Register("bad", func(_ context.Context, _ Task) error { return errors.New("boom") })

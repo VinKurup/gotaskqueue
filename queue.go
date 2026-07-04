@@ -74,6 +74,7 @@ type Queue interface {
 	Cleanup() (int, error)
 	DeadLetters() ([]Task, error)
 	Replay(id string) (bool, error)
+	Discard(id string) (bool, error)
 }
 
 var (
@@ -535,6 +536,17 @@ func (q *MemoryQueue) Replay(id string) (bool, error) {
 	t.FinishedAt = time.Time{}
 	q.push(t)
 	q.cond.Signal()
+	return true, nil
+}
+
+func (q *MemoryQueue) Discard(id string) (bool, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	t, ok := q.tasks[id]
+	if !ok || t.Status != StatusFailed {
+		return false, nil
+	}
+	delete(q.tasks, id)
 	return true, nil
 }
 

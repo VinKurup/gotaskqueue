@@ -686,6 +686,21 @@ func (q *RedisQueue) Replay(id string) (bool, error) {
 	return true, nil
 }
 
+func (q *RedisQueue) Discard(id string) (bool, error) {
+	ctx := context.Background()
+	t, ok, err := q.getTask(ctx, id)
+	if err != nil {
+		return false, err
+	}
+	if !ok || t.Status != StatusFailed {
+		return false, nil
+	}
+	if err := q.client.HDel(ctx, q.tasksKey(), id).Err(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (q *RedisQueue) Cleanup() (int, error) {
 	ctx := context.Background()
 	m, err := q.client.HGetAll(ctx, q.tasksKey()).Result()
