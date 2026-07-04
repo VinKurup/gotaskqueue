@@ -563,6 +563,34 @@ func TestRedisCancelPending(t *testing.T) {
 	}
 }
 
+func TestRedisBoundedShutdown(t *testing.T) {
+	q := NewRedisQueue(newTestRedis(t), "jobs",
+		WithRedisShutdownTimeout(50*time.Millisecond), WithRedisPollInterval(5*time.Millisecond))
+
+	entered := make(chan struct{})
+	block := make(chan struct{})
+	q.Register("stuck", func(_ context.Context, _ Task) error {
+		close(entered)
+		<-block // ignores ctx, blocks forever
+		return nil
+	})
+
+	q.Start(1)
+	q.Enqueue("stuck", nil)
+	<-entered
+
+	done := make(chan struct{})
+	go func() { q.Stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not return within the shutdown timeout despite a stuck handler")
+	}
+
+	close(block)
+	time.Sleep(50 * time.Millisecond) // let the worker drain before miniredis closes
+}
+
 func TestRedisHandlerTimeout(t *testing.T) {
 	q := NewRedisQueue(newTestRedis(t), "jobs",
 		WithRedisHandlerTimeout(20*time.Millisecond), WithRedisMaxRetries(0),

@@ -456,6 +456,32 @@ func TestProcessNextPromotesDueDelayed(t *testing.T) {
 	}
 }
 
+func TestBoundedShutdown(t *testing.T) {
+	q := NewMemoryQueue("jobs", WithShutdownTimeout(50*time.Millisecond))
+
+	entered := make(chan struct{})
+	block := make(chan struct{})
+	q.Register("stuck", func(_ context.Context, _ Task) error {
+		close(entered)
+		<-block // ignores ctx, blocks forever
+		return nil
+	})
+
+	q.Start(1)
+	q.Enqueue("stuck", nil)
+	<-entered
+
+	done := make(chan struct{})
+	go func() { q.Stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not return within the shutdown timeout despite a stuck handler")
+	}
+
+	close(block) // let the leaked goroutine finish
+}
+
 func TestHandlerTimeout(t *testing.T) {
 	q := NewMemoryQueue("jobs", WithHandlerTimeout(20*time.Millisecond), WithMaxRetries(0))
 

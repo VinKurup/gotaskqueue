@@ -72,6 +72,10 @@ func WithRedisHandlerTimeout(d time.Duration) RedisOption {
 	return func(q *RedisQueue) { q.handlerTimeout = d }
 }
 
+func WithRedisShutdownTimeout(d time.Duration) RedisOption {
+	return func(q *RedisQueue) { q.shutdownTimeout = d }
+}
+
 type RedisQueue struct {
 	client            *redis.Client
 	name              string
@@ -85,6 +89,7 @@ type RedisQueue struct {
 	visibilityTimeout time.Duration
 	maxDeliveries     int
 	handlerTimeout    time.Duration
+	shutdownTimeout   time.Duration
 
 	mu       sync.Mutex
 	handlers map[string]Handler
@@ -256,7 +261,7 @@ func (q *RedisQueue) Stop() {
 		}
 		q.client.RPush(context.Background(), q.readyKey(), sentinels...)
 	}
-	q.wg.Wait()
+	waitWithTimeout(&q.wg, q.shutdownTimeout)
 }
 
 func (q *RedisQueue) worker() {

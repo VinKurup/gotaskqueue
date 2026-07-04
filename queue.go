@@ -93,6 +93,10 @@ func WithHandlerTimeout(d time.Duration) Option {
 	return func(q *MemoryQueue) { q.handlerTimeout = d }
 }
 
+func WithShutdownTimeout(d time.Duration) Option {
+	return func(q *MemoryQueue) { q.shutdownTimeout = d }
+}
+
 type MemoryQueue struct {
 	name            string
 	mu              sync.Mutex
@@ -114,6 +118,7 @@ type MemoryQueue struct {
 	cleanupInterval time.Duration
 	maxTasks        int
 	handlerTimeout  time.Duration
+	shutdownTimeout time.Duration
 	done            chan struct{}
 	started         bool
 	stopped         bool
@@ -228,7 +233,23 @@ func (q *MemoryQueue) Stop() {
 	q.mu.Unlock()
 
 	q.wakeScheduler()
-	q.wg.Wait()
+	waitWithTimeout(&q.wg, q.shutdownTimeout)
+}
+
+// waitWithTimeout waits for the WaitGroup, giving up after timeout (0 = wait
+// forever). On timeout the outstanding goroutines are left running — the caller
+// has decided a stuck handler shouldn't hold up shutdown.
+func waitWithTimeout(wg *sync.WaitGroup, timeout time.Duration) {
+	if timeout <= 0 {
+		wg.Wait()
+		return
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+	}
 }
 
 func (q *MemoryQueue) cleanupLoop() {
