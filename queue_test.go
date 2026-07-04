@@ -456,6 +456,34 @@ func TestProcessNextPromotesDueDelayed(t *testing.T) {
 	}
 }
 
+func TestHandlerTimeout(t *testing.T) {
+	q := NewMemoryQueue("jobs", WithHandlerTimeout(20*time.Millisecond), WithMaxRetries(0))
+
+	fired := make(chan error, 1)
+	q.Register("slow", func(ctx context.Context, _ Task) error {
+		<-ctx.Done()
+		fired <- ctx.Err()
+		return ctx.Err()
+	})
+
+	q.Start(1)
+	defer q.Stop()
+
+	id, _ := q.Enqueue("slow", nil)
+
+	select {
+	case err := <-fired:
+		if err != context.DeadlineExceeded {
+			t.Fatalf("handler ctx error = %v, want DeadlineExceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler was never timed out")
+	}
+
+	// A timeout is a failure (retryable), not a cancellation.
+	waitForStatus(t, q, id, StatusFailed, 2*time.Second)
+}
+
 func TestCancelInFlightHandler(t *testing.T) {
 	q := NewMemoryQueue("jobs", WithMaxRetries(3))
 

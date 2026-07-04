@@ -563,6 +563,35 @@ func TestRedisCancelPending(t *testing.T) {
 	}
 }
 
+func TestRedisHandlerTimeout(t *testing.T) {
+	q := NewRedisQueue(newTestRedis(t), "jobs",
+		WithRedisHandlerTimeout(20*time.Millisecond), WithRedisMaxRetries(0),
+		WithRedisPollInterval(5*time.Millisecond))
+
+	fired := make(chan error, 1)
+	q.Register("slow", func(ctx context.Context, _ Task) error {
+		<-ctx.Done()
+		fired <- ctx.Err()
+		return ctx.Err()
+	})
+
+	q.Start(1)
+	defer q.Stop()
+
+	id, _ := q.Enqueue("slow", nil)
+
+	select {
+	case err := <-fired:
+		if err != context.DeadlineExceeded {
+			t.Fatalf("handler ctx error = %v, want DeadlineExceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler was never timed out")
+	}
+
+	waitForRedisStatus(t, q, id, StatusFailed, 2*time.Second)
+}
+
 func TestRedisCancelInFlight(t *testing.T) {
 	q := NewRedisQueue(newTestRedis(t), "jobs",
 		WithRedisMaxRetries(3), WithRedisPollInterval(5*time.Millisecond))

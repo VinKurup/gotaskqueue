@@ -24,9 +24,6 @@ const defaultVisibilityTimeout = 30 * time.Second
 
 const defaultMaxDeliveries = 3
 
-// promoteScript atomically claims a due task off the delayed set and pushes it
-// onto the ready list. The conditional on ZREM is the claim: only the caller that
-// actually removes the id proceeds, so concurrent promoters can't double-promote.
 var promoteScript = redis.NewScript(`
 if redis.call('ZREM', KEYS[1], ARGV[1]) == 1 then
   redis.call('LPUSH', KEYS[2], ARGV[1])
@@ -71,6 +68,10 @@ func WithRedisMaxDeliveries(n int) RedisOption {
 	return func(q *RedisQueue) { q.maxDeliveries = n }
 }
 
+func WithRedisHandlerTimeout(d time.Duration) RedisOption {
+	return func(q *RedisQueue) { q.handlerTimeout = d }
+}
+
 type RedisQueue struct {
 	client            *redis.Client
 	name              string
@@ -83,6 +84,7 @@ type RedisQueue struct {
 	maxTasks          int
 	visibilityTimeout time.Duration
 	maxDeliveries     int
+	handlerTimeout    time.Duration
 
 	mu       sync.Mutex
 	handlers map[string]Handler
@@ -158,8 +160,6 @@ func (q *RedisQueue) EnqueueDelayed(taskType string, data []byte, delay time.Dur
 	return t.ID, nil
 }
 
-// newTask allocates an ID and builds a task with its marshaled form. It does not
-// write anything; the caller registers and enqueues it atomically.
 func (q *RedisQueue) newTask(ctx context.Context, taskType string, data []byte, status TaskStatus) (*Task, []byte, error) {
 	if taskType == "" {
 		return nil, nil, errors.New("task type cannot be empty")
@@ -447,10 +447,17 @@ func (q *RedisQueue) runTask(ctx context.Context, t *Task) error {
 	}
 
 	q.client.Del(ctx, q.cancelKey(t.ID))
-	hctx, cancel := context.WithCancel(context.Background())
+	baseCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	watchDone := make(chan struct{})
 	go q.watchCancel(t.ID, cancel, watchDone)
+
+	hctx := baseCtx
+	if q.handlerTimeout > 0 {
+		var tcancel context.CancelFunc
+		hctx, tcancel = context.WithTimeout(baseCtx, q.handlerTimeout)
+		defer tcancel()
+	}
 
 	t.Status = StatusProcessing
 	if err := q.save(ctx, t); err != nil {
@@ -462,7 +469,9 @@ func (q *RedisQueue) runTask(ctx context.Context, t *Task) error {
 	close(watchDone)
 	q.client.Del(ctx, q.cancelKey(t.ID))
 
-	if hctx.Err() != nil {
+	// Only watchCancel cancels baseCtx; a timeout fires the child hctx, so it is
+	// a failure (retryable), not a cancellation.
+	if baseCtx.Err() == context.Canceled {
 		t.Status = StatusCancelled
 		t.FinishedAt = time.Now()
 		_ = q.save(ctx, t)
@@ -503,8 +512,7 @@ func (q *RedisQueue) retryOrFail(ctx context.Context, t *Task, herr error) error
 			return err
 		}
 		score := unixScore(time.Now().Add(expBackoff(q.backoffBase, q.backoffMax, t.Retries)))
-		// Update status and reschedule atomically, so a failure can't leave a
-		// task marked scheduled but absent from the delayed set (never promoted).
+
 		_, err = q.client.TxPipelined(ctx, func(p redis.Pipeliner) error {
 			p.HSet(ctx, q.tasksKey(), t.ID, b)
 			p.ZAdd(ctx, q.delayedKey(), redis.Z{Score: score, Member: t.ID})

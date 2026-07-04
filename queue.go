@@ -89,6 +89,10 @@ func WithMaxTasks(n int) Option {
 	return func(q *MemoryQueue) { q.maxTasks = n }
 }
 
+func WithHandlerTimeout(d time.Duration) Option {
+	return func(q *MemoryQueue) { q.handlerTimeout = d }
+}
+
 type MemoryQueue struct {
 	name            string
 	mu              sync.Mutex
@@ -109,6 +113,7 @@ type MemoryQueue struct {
 	taskTTL         time.Duration
 	cleanupInterval time.Duration
 	maxTasks        int
+	handlerTimeout  time.Duration
 	done            chan struct{}
 	started         bool
 	stopped         bool
@@ -346,15 +351,24 @@ func (q *MemoryQueue) runTask(t *Task) error {
 		q.setStatus(t, StatusFailed)
 		return errors.New("no handler registered for task type " + t.Type)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	baseCtx, cancel := context.WithCancel(context.Background())
 	q.inflight[t.ID] = cancel
 	q.mu.Unlock()
 
-	err := h(ctx, *t)
+	hctx := baseCtx
+	if q.handlerTimeout > 0 {
+		var tcancel context.CancelFunc
+		hctx, tcancel = context.WithTimeout(baseCtx, q.handlerTimeout)
+		defer tcancel()
+	}
+
+	err := h(hctx, *t)
 
 	q.mu.Lock()
 	delete(q.inflight, t.ID)
-	cancelled := ctx.Err() != nil
+	// Only an external Cancel touches baseCtx; a timeout fires the child hctx and
+	// leaves baseCtx untouched, so it counts as a failure, not a cancellation.
+	cancelled := baseCtx.Err() == context.Canceled
 	cancel()
 	if cancelled {
 		t.Status = StatusCancelled
