@@ -22,6 +22,16 @@ const stopSentinel = "__stop__"
 
 const defaultVisibilityTimeout = 30 * time.Second
 
+// promoteScript atomically claims a due task off the delayed set and pushes it
+// onto the ready list. The conditional on ZREM is the claim: only the caller that
+// actually removes the id proceeds, so concurrent promoters can't double-promote.
+var promoteScript = redis.NewScript(`
+if redis.call('ZREM', KEYS[1], ARGV[1]) == 1 then
+  redis.call('LPUSH', KEYS[2], ARGV[1])
+  return 1
+end
+return 0`)
+
 type RedisOption func(*RedisQueue)
 
 func WithRedisMaxRetries(n int) RedisOption {
@@ -399,17 +409,20 @@ func (q *RedisQueue) promoteDue(ctx context.Context) {
 		return
 	}
 	for _, id := range ids {
-		claimed, err := q.client.ZRem(ctx, q.delayedKey(), id).Result()
-		if err != nil || claimed == 0 {
+		t, ok, err := q.getTask(ctx, id)
+		if err != nil {
 			continue
 		}
-		t, ok, err := q.getTask(ctx, id)
-		if err != nil || !ok || t.Status == StatusCancelled {
+		if !ok || t.Status == StatusCancelled {
+			q.client.ZRem(ctx, q.delayedKey(), id) // drop missing/cancelled
 			continue
+		}
+		promoted, err := promoteScript.Run(ctx, q.client, []string{q.delayedKey(), q.readyKey()}, id).Int()
+		if err != nil || promoted == 0 {
+			continue // another promoter claimed it
 		}
 		t.Status = StatusPending
-		q.save(ctx, &t)
-		q.client.LPush(ctx, q.readyKey(), id)
+		q.save(ctx, &t) // reflect status; the worker overwrites it on pickup
 	}
 }
 
@@ -477,20 +490,27 @@ func (q *RedisQueue) retryOrFail(ctx context.Context, t *Task, herr error) error
 	if t.Retries < t.MaxRetries {
 		t.Retries++
 		t.Status = StatusScheduled
-		if err := q.save(ctx, t); err != nil {
+		b, err := json.Marshal(t)
+		if err != nil {
 			return err
 		}
-		q.schedule(ctx, t.ID, time.Now().Add(expBackoff(q.backoffBase, q.backoffMax, t.Retries)))
+		score := unixScore(time.Now().Add(expBackoff(q.backoffBase, q.backoffMax, t.Retries)))
+		// Update status and reschedule atomically, so a failure can't leave a
+		// task marked scheduled but absent from the delayed set (never promoted).
+		_, err = q.client.TxPipelined(ctx, func(p redis.Pipeliner) error {
+			p.HSet(ctx, q.tasksKey(), t.ID, b)
+			p.ZAdd(ctx, q.delayedKey(), redis.Z{Score: score, Member: t.ID})
+			return nil
+		})
+		if err != nil {
+			return err
+		}
 		return herr
 	}
 	t.Status = StatusFailed
 	t.FinishedAt = time.Now()
 	_ = q.save(ctx, t)
 	return herr
-}
-
-func (q *RedisQueue) schedule(ctx context.Context, id string, runAt time.Time) error {
-	return q.client.ZAdd(ctx, q.delayedKey(), redis.Z{Score: unixScore(runAt), Member: id}).Err()
 }
 
 func (q *RedisQueue) Cancel(id string) (bool, error) {

@@ -253,6 +253,53 @@ func TestRedisProcessNextPromotesDueDelayed(t *testing.T) {
 	}
 }
 
+func TestRedisPromoteClaimsOnce(t *testing.T) {
+	client := newTestRedis(t)
+	q := NewRedisQueue(client, "jobs")
+	ctx := context.Background()
+
+	id, _ := q.EnqueueDelayed("job", nil, 0) // due immediately, sitting in delayed
+
+	// Two promoters racing on the same due task: the claim must let only one move it.
+	p1, _ := promoteScript.Run(ctx, client, []string{q.delayedKey(), q.readyKey()}, id).Int()
+	p2, _ := promoteScript.Run(ctx, client, []string{q.delayedKey(), q.readyKey()}, id).Int()
+	if p1 != 1 || p2 != 0 {
+		t.Fatalf("claim: p1=%d p2=%d, want 1 and 0", p1, p2)
+	}
+
+	ready, _ := client.LRange(ctx, q.readyKey(), 0, -1).Result()
+	n := 0
+	for _, v := range ready {
+		if v == id {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("id promoted %d times, want exactly 1", n)
+	}
+}
+
+func TestRedisRetryReschedulesAtomically(t *testing.T) {
+	client := newTestRedis(t)
+	q := NewRedisQueue(client, "jobs", WithRedisMaxRetries(3), WithRedisBackoff(time.Hour, time.Hour))
+	q.Register("bad", func(_ context.Context, _ Task) error { return errors.New("nope") })
+
+	id, _ := q.Enqueue("bad", nil)
+	q.ProcessNext() // handler errors -> retryOrFail reschedules
+
+	got, _, _ := q.GetTask(id)
+	if got.Status != StatusScheduled {
+		t.Fatalf("status %q, want scheduled", got.Status)
+	}
+	if got.Retries != 1 {
+		t.Fatalf("retries %d, want 1", got.Retries)
+	}
+	sched, _ := client.ZRange(context.Background(), q.delayedKey(), 0, -1).Result()
+	if !contains(sched, id) {
+		t.Fatalf("rescheduled task not in delayed set: %v", sched)
+	}
+}
+
 func TestRedisRetryEventuallyFails(t *testing.T) {
 	q := NewRedisQueue(newTestRedis(t), "jobs",
 		WithRedisMaxRetries(2), WithRedisBackoff(time.Millisecond, 5*time.Millisecond))
