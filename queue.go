@@ -39,8 +39,9 @@ type Task struct {
 	Status     TaskStatus
 	CreatedAt  time.Time
 	FinishedAt time.Time
-	Retries    int
+	Retries    int // handler-error retries
 	MaxRetries int
+	Deliveries int // crash redeliveries (Redis reaper); separate from Retries
 }
 
 type Handler func(context.Context, Task) error

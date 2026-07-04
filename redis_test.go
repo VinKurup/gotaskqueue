@@ -470,7 +470,7 @@ func TestRedisInflightClearedAfterCompletion(t *testing.T) {
 
 func TestRedisReaperPoisonCap(t *testing.T) {
 	client := newTestRedis(t)
-	q := NewRedisQueue(client, "jobs", WithRedisMaxRetries(1), WithRedisVisibilityTimeout(time.Millisecond))
+	q := NewRedisQueue(client, "jobs", WithRedisMaxDeliveries(1), WithRedisVisibilityTimeout(time.Millisecond))
 	id, _ := q.Enqueue("job", nil)
 	ctx := context.Background()
 
@@ -480,14 +480,37 @@ func TestRedisReaperPoisonCap(t *testing.T) {
 	}
 
 	strand()
-	q.reap(ctx) // 1st redelivery: Retries 0->1, still <= max
+	q.reap(ctx) // 1st redelivery: Deliveries 0->1, still <= max
 	if got, _, _ := q.GetTask(id); got.Status != StatusPending {
 		t.Fatalf("after 1st reap: status %q, want pending", got.Status)
 	}
 	strand()
-	q.reap(ctx) // 2nd: Retries 1->2 > max -> poison -> failed
+	q.reap(ctx) // 2nd: Deliveries 1->2 > max -> poison -> failed
 	if got, _, _ := q.GetTask(id); got.Status != StatusFailed {
 		t.Fatalf("after 2nd reap: status %q, want failed", got.Status)
+	}
+}
+
+func TestRedisReaperDoesNotBurnRetryBudget(t *testing.T) {
+	client := newTestRedis(t)
+	q := NewRedisQueue(client, "jobs",
+		WithRedisMaxRetries(3), WithRedisMaxDeliveries(5), WithRedisVisibilityTimeout(time.Millisecond))
+	id, _ := q.Enqueue("job", nil)
+	ctx := context.Background()
+
+	client.RPopLPush(ctx, q.readyKey(), q.inflightKey())
+	client.ZAdd(ctx, q.deadlineKey(), redis.Z{Score: unixScore(time.Now().Add(-time.Second)), Member: id})
+	q.reap(ctx)
+
+	got, _, _ := q.GetTask(id)
+	if got.Retries != 0 {
+		t.Fatalf("Retries=%d; a crash redelivery must not consume the handler-retry budget", got.Retries)
+	}
+	if got.Deliveries != 1 {
+		t.Fatalf("Deliveries=%d, want 1", got.Deliveries)
+	}
+	if got.Status != StatusPending {
+		t.Fatalf("status %q, want pending", got.Status)
 	}
 }
 

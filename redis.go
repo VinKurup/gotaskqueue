@@ -22,6 +22,8 @@ const stopSentinel = "__stop__"
 
 const defaultVisibilityTimeout = 30 * time.Second
 
+const defaultMaxDeliveries = 3
+
 // promoteScript atomically claims a due task off the delayed set and pushes it
 // onto the ready list. The conditional on ZREM is the claim: only the caller that
 // actually removes the id proceeds, so concurrent promoters can't double-promote.
@@ -65,6 +67,10 @@ func WithRedisVisibilityTimeout(d time.Duration) RedisOption {
 	return func(q *RedisQueue) { q.visibilityTimeout = d }
 }
 
+func WithRedisMaxDeliveries(n int) RedisOption {
+	return func(q *RedisQueue) { q.maxDeliveries = n }
+}
+
 type RedisQueue struct {
 	client            *redis.Client
 	name              string
@@ -76,6 +82,7 @@ type RedisQueue struct {
 	cleanupInterval   time.Duration
 	maxTasks          int
 	visibilityTimeout time.Duration
+	maxDeliveries     int
 
 	mu       sync.Mutex
 	handlers map[string]Handler
@@ -97,6 +104,7 @@ func NewRedisQueue(client *redis.Client, name string, opts ...RedisOption) *Redi
 		taskTTL:           defaultTaskTTL,
 		cleanupInterval:   defaultCleanupInterval,
 		visibilityTimeout: defaultVisibilityTimeout,
+		maxDeliveries:     defaultMaxDeliveries,
 		handlers:          make(map[string]Handler),
 		done:              make(chan struct{}),
 	}
@@ -376,8 +384,8 @@ func (q *RedisQueue) reap(ctx context.Context) {
 			continue // finished; ack was just lost, nothing to redeliver
 		}
 
-		t.Retries++
-		if t.Retries > t.MaxRetries {
+		t.Deliveries++
+		if t.Deliveries > q.maxDeliveries {
 			t.Status = StatusFailed
 			t.FinishedAt = time.Now()
 			q.save(ctx, &t)
